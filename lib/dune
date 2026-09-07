@@ -1,0 +1,15 @@
+(library
+ (name handsome)
+ (public_name handsome))
+
+; Every warning on and every warning fatal, in the dev profile, with 44 off:
+; [open StdLabels] shadows List, Array, String and Bytes, which is why it is
+; here. Scoped to the library, since warning 70 asks each module for an .mli.
+; That suits the deliverable and burdens a test helper. Under the release
+; profile the warnings stay on and stop being fatal, which lets the mutation
+; harness build a mutant that leaves a value unused.
+
+(env
+ (dev
+  (flags
+   (:standard -w +a-44-48 -warn-error +a))))

@@ -1,0 +1,19 @@
+; Checks lib/unicode_tables.ml against what tools/gen_unicode_tables.py produces
+; for the Unicode release it names:
+;
+;     dune build @unicode
+;
+; and, if it is not, says so with a diff and the command to regenerate. Its own
+; alias, and deliberately target-less so that it stays out of @default and @all:
+; the generator reads the Unicode Character Database over the network, and a
+; build that needs the network is a build that fails in an opam sandbox, in CI
+; without egress, and on a train. Pass --ucd <dir> to the script to work from a
+; local copy instead.
+
+(rule
+ (alias unicode)
+ (deps
+  (:gen ../gen_unicode_tables.py)
+  (:tables %{project_root}/lib/unicode_tables.ml))
+ (action
+  (run python3 %{gen} --check %{tables})))

@@ -1,0 +1,3 @@
+; A working directory. Out of the package and out of the build.
+
+(dirs :standard \ scratch)

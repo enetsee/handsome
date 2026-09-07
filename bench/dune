@@ -1,0 +1,6 @@
+; Not part of the package. Measures that rendering is linear in the document,
+; including the case a try-flat-then-retry engine goes quadratic on.
+
+(executable
+ (name bench)
+ (libraries handsome))

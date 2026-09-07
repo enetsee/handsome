@@ -1,0 +1,33 @@
+(test
+ (name test_handsome)
+ (modules
+  reader
+  reference
+  surface
+  test_diff
+  test_doc
+  test_handsome
+  test_laws
+  test_render
+  test_width)
+ (libraries handsome pprint alcotest qcheck-core qcheck-alcotest))
+
+; The stack guarantee is invisible at OCaml 5's default settings, where the main
+; fibre's stack grows on demand. It gets its own executable and its own runtime
+; configuration, so the cap applies to it and to nothing else -- the rest of the
+; suite builds documents that would not fit under it. 1M words is about 8 MB,
+; roughly what the declared 4.14 floor gets from the OS, and on 4.14 the OS
+; default supplies the same bound whether or not the variable is read.
+
+(executable
+ (name test_depth)
+ (modules test_depth)
+ (libraries handsome))
+
+(rule
+ (alias runtest)
+ (action
+  (setenv
+   OCAMLRUNPARAM
+   l=1000000
+   (run %{exe:test_depth.exe}))))
