@@ -1,5 +1,3 @@
-open StdLabels
-
 let () =
   Alcotest.run
     "handsome"
