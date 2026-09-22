@@ -17,6 +17,16 @@ libraries leave out:
 Also:
 
 - `flat_alt` is the primitive; `line`, `softline` and `blank` derive from it.
+- `framed`: a group whose body is handed a conditional that follows it from any
+  depth. `flat_alt` follows the group directly around it, which is wrong for a
+  trailing separator: the whole list decides whether it appears, and the last
+  element's line prints it. In `framed (fun alt -> ...)`, `alt a b` is `a` where
+  the frame was laid out flat and `b` where it broke. Measurement stays exact,
+  so a list with a trailing comma fits at exactly the width it prints at; the
+  one exception, a conditional inside another frame's conditional, is measured
+  at its wider branch. `check` reports a conditional used outside its frame.
+- `add` must be commutative as well as associative, since a frame adds up its
+  conditionals' widths out of document order.
 - Width is a functor parameter with a documented obligation — `measure` must
   never *under*-report display width — and two instances: `Ascii_width`
   (bytes) and `Utf8_width` (terminal columns, from tables generated out of the

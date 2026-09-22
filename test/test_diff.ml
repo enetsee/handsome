@@ -24,7 +24,12 @@
    PPrint's suppressible blanks ([blank], [space], [break]) lie outside the
    shared fragment. They are a property of PPrint's renderer, where every
    handsome construct is a property of the document.
-   [idiomatic_up_to_blanks] below measures that gap. *)
+   [idiomatic_up_to_blanks] below measures that gap.
+
+   [framed] lies outside it too: PPrint has no conditional on an outer group.
+   The corpora here, [Surface.plain] and [Surface.rich], leave frames out for
+   that reason, so [framed] is checked against the reference renderer alone,
+   and no independently written printer. That gap is permanent. *)
 
 open StdLabels
 module H = Handsome.Ascii

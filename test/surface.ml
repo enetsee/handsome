@@ -2,8 +2,13 @@
 
    Tests generate values of this type, so the same generated case can be
    interpreted three ways: into a handsome document, into a PPrint document for
-   the differential, and into the list of text nodes carrying a newline, which is
-   the ground truth for [check]. It also prints and shrinks. *)
+   the differential, and into the offences [check] should report, which is its
+   ground truth. It also prints and shrinks.
+
+   [Framed] is [framed], and [Frame_alt] one of the conditionals it hands out,
+   written as a reference to an enclosing [Framed]: [Frame_alt (0, _, _)] reads
+   the innermost [Framed] around it, [1] the next out, and an index past the last
+   is a conditional outside its frame. *)
 
 open StdLabels
 
@@ -21,6 +26,8 @@ type t =
   | Nest of int * t
   | Align of t
   | Annot of int * t
+  | Framed of t
+  | Frame_alt of int * t * t
 
 (* -- interpretation into handsome ------------------------------------------ *)
 
@@ -30,20 +37,47 @@ module type DOC = Handsome.S with type width = int
    one width instance: the laws are re-run under Utf8 as well as Ascii, and
    several properties compare the two renderings of one document. *)
 module Doc (H : DOC) = struct
-  let rec to_doc : t -> int H.t = function
-    | Text s -> H.text s
-    | Empty -> H.empty
-    | Cat (a, b) -> H.(to_doc a ^^ to_doc b)
-    | Concat ds -> H.concat (List.map ~f:to_doc ds)
-    | Flat_alt (a, b) -> H.flat_alt (to_doc a) (to_doc b)
-    | Line -> H.line
-    | Softline -> H.softline
-    | Hardline -> H.hardline
-    | Blank -> H.blank
-    | Group d -> H.group (to_doc d)
-    | Nest (j, d) -> H.nest j (to_doc d)
-    | Align d -> H.align (to_doc d)
-    | Annot (a, d) -> H.annotate a (to_doc d)
+  (* A conditional whose frame has already closed. Letting [alt] escape its
+     callback is the only way to place one outside its frame. *)
+  let stray () =
+    let got = ref None in
+    ignore
+      (H.framed (fun alt ->
+         got := Some alt;
+         H.empty)
+       : int H.t);
+    match !got with
+    | Some alt -> alt
+    | None -> assert false
+  ;;
+
+  (* [alts] holds the conditionals of the enclosing [Framed]s, innermost first,
+     and an index past the end takes a stray one. *)
+  let to_doc : t -> int H.t =
+    let rec go alts = function
+      | Text s -> H.text s
+      | Empty -> H.empty
+      | Cat (a, b) -> H.(go alts a ^^ go alts b)
+      | Concat ds -> H.concat (List.map ~f:(go alts) ds)
+      | Flat_alt (a, b) -> H.flat_alt (go alts a) (go alts b)
+      | Line -> H.line
+      | Softline -> H.softline
+      | Hardline -> H.hardline
+      | Blank -> H.blank
+      | Group d -> H.group (go alts d)
+      | Nest (j, d) -> H.nest j (go alts d)
+      | Align d -> H.align (go alts d)
+      | Annot (a, d) -> H.annotate a (go alts d)
+      | Framed d -> H.framed (fun alt -> go (alt :: alts) d)
+      | Frame_alt (i, a, b) ->
+        let alt =
+          match List.nth_opt alts i with
+          | Some alt -> alt
+          | None -> stray ()
+        in
+        alt (go alts a) (go alts b)
+    in
+    go []
   ;;
 end
 
@@ -64,7 +98,15 @@ let to_doc = Ascii_doc.to_doc
 
    [to_pprint_idiomatic] below is the mapping a PPrint user would write, and the
    difference between the two is measured.
+
+   PPrint has no conditional on an outer group, so [Frame_alt] has no
+   counterpart and both mappings reject it. [Framed] with nothing reading its tag
+   is a group, and maps to one.
    -------------------------------------------------------------------------- *)
+
+let no_counterpart () =
+  invalid_arg "Surface.to_pprint: a frame's conditional has no PPrint counterpart"
+;;
 
 let ( ^^ ) = PPrint.( ^^ )
 
@@ -83,6 +125,8 @@ let rec to_pprint : t -> PPrint.document = function
   | Nest (j, d) -> PPrint.nest j (to_pprint d)
   | Align d -> PPrint.align (to_pprint d)
   | Annot (_, d) -> to_pprint d
+  | Framed d -> PPrint.group (to_pprint d)
+  | Frame_alt _ -> no_counterpart ()
 ;;
 
 let rec to_pprint_idiomatic : t -> PPrint.document = function
@@ -103,6 +147,8 @@ let rec to_pprint_idiomatic : t -> PPrint.document = function
   | Nest (j, d) -> PPrint.nest j (to_pprint_idiomatic d)
   | Align d -> PPrint.align (to_pprint_idiomatic d)
   | Annot (_, d) -> to_pprint_idiomatic d
+  | Framed d -> PPrint.group (to_pprint_idiomatic d)
+  | Frame_alt _ -> no_counterpart ()
 ;;
 
 let pprint_to_string ?(f = to_pprint) ~width d =
@@ -113,23 +159,73 @@ let pprint_to_string ?(f = to_pprint) ~width d =
 
 (* -- ground truth for [check] ---------------------------------------------- *)
 
-(* The offending text nodes, in the document order [check] reports them in. *)
+type offence =
+  | Newline of string * int (** the text node, and the byte its first newline is at *)
+  | Outside of int (** the number [check] and [pp] give its frame *)
+
+(* Whether the smart constructors reduce [d] to [empty]. A [Framed] over such a
+   body builds no frame, so it takes no number below. *)
+let rec is_empty = function
+  | Text s -> String.length s = 0
+  | Empty -> true
+  | Cat (a, b) -> is_empty a && is_empty b
+  | Concat ds -> List.for_all ~f:is_empty ds
+  | Group d | Nest (_, d) | Align d | Framed d -> is_empty d
+  | Annot _ | Flat_alt _ | Line | Softline | Hardline | Blank | Frame_alt _ -> false
+;;
+
+(* The offending nodes, in the document order [check] reports them in. Frames
+   are numbered from 0 as [check] first meets them: where one opens, and, for a
+   conditional outside its frame, where the conditional stands. *)
 let offenders d =
   let acc = ref [] in
-  let rec go = function
+  let next = ref 0 in
+  let fresh () =
+    let n = !next in
+    incr next;
+    n
+  in
+  let rec go scope = function
     | Text s ->
       (match String.index_opt s '\n' with
-       | Some i -> acc := (s, i) :: !acc
+       | Some i -> acc := Newline (s, i) :: !acc
        | None -> ())
     | Empty | Line | Softline | Hardline | Blank -> ()
     | Cat (a, b) | Flat_alt (a, b) ->
-      go a;
-      go b
-    | Concat ds -> List.iter ~f:go ds
-    | Group d | Nest (_, d) | Align d | Annot (_, d) -> go d
+      go scope a;
+      go scope b
+    | Concat ds -> List.iter ~f:(go scope) ds
+    | Group d | Nest (_, d) | Align d | Annot (_, d) -> go scope d
+    | Framed d -> if not (is_empty d) then go (fresh () :: scope) d
+    | Frame_alt (i, a, b) ->
+      if i >= List.length scope then acc := Outside (fresh ()) :: !acc;
+      go scope a;
+      go scope b
   in
-  go d;
+  go [] d;
   List.rev !acc
+;;
+
+(* -- the case measured conservatively ---------------------------------------- *)
+
+(* Whether [d] holds a conditional whose [Framed] is outside it. *)
+let rec has_free depth = function
+  | Frame_alt (i, a, b) -> i >= depth || has_free depth a || has_free depth b
+  | Framed d -> has_free (depth + 1) d
+  | Cat (a, b) | Flat_alt (a, b) -> has_free depth a || has_free depth b
+  | Concat ds -> List.exists ~f:(has_free depth) ds
+  | Group d | Nest (_, d) | Align d | Annot (_, d) -> has_free depth d
+  | Text _ | Empty | Line | Softline | Hardline | Blank -> false
+;;
+
+(* Whether a conditional's branch holds a conditional free in that branch,
+   which the interface measures at its wider branch. *)
+let rec nested_free = function
+  | Frame_alt (_, a, b) -> has_free 0 a || has_free 0 b || nested_free a || nested_free b
+  | Framed d | Group d | Nest (_, d) | Align d | Annot (_, d) -> nested_free d
+  | Cat (a, b) | Flat_alt (a, b) -> nested_free a || nested_free b
+  | Concat ds -> List.exists ~f:nested_free ds
+  | Text _ | Empty | Line | Softline | Hardline | Blank -> false
 ;;
 
 (* -- printing, for failure output ------------------------------------------ *)
@@ -148,6 +244,8 @@ let rec show = function
   | Nest (j, d) -> Printf.sprintf "(nest %d %s)" j (show d)
   | Align d -> Printf.sprintf "(align %s)" (show d)
   | Annot (a, d) -> Printf.sprintf "(annotate %d %s)" a (show d)
+  | Framed d -> Printf.sprintf "(framed %s)" (show d)
+  | Frame_alt (i, a, b) -> Printf.sprintf "(frame_alt %d %s %s)" i (show a) (show b)
 ;;
 
 (* -- generation ------------------------------------------------------------ *)
@@ -171,6 +269,12 @@ type flavour =
     (** [align] is one of exactly two ways the measure reaches the output --
           it turns a column into an indentation -- so a property about the other
           way, the fit decision, has to be able to switch it off. *)
+  ; frames : bool
+    (** [framed] and its conditionals. PPrint has no conditional on an outer
+          group, so the differential corpora leave these off, and [framed] is
+          compared with no independently written printer. That loss is
+          permanent. {!Reference} is the second implementation it is checked
+          against, and was written from the same specification. *)
   }
 
 let plain =
@@ -181,17 +285,19 @@ let plain =
   ; unicode = false
   ; malformed = false
   ; aligns = true
+  ; frames = false
   }
 ;;
 
 let rich = { plain with annotations = true; general_flat_alt = true; unicode = true }
 
-(* Well-formed UTF-8, exercising dedent. *)
-let wild = { rich with neg_nest = true }
+(* Well-formed UTF-8, exercising dedent and frames, which PPrint cannot
+   express. *)
+let wild = { rich with neg_nest = true; frames = true }
 let no_align = { wild with aligns = false }
 
 (* [wild] restricted to the derived breaks, whose two branches differ in
-   whitespace alone. *)
+   whitespace alone. A [Frame_alt] there has branches of the same kind. *)
 let breaks_only = { wild with general_flat_alt = false }
 
 (* Everything the library accepts, including what [check] rejects and bytes
@@ -229,16 +335,35 @@ let gen_text flavour =
   Gen.oneof_weighted choices
 ;;
 
+(* Mostly the innermost frame, sometimes one further out, and sometimes a frame
+   that is not there. *)
+let gen_index = Gen.oneof_weighted [ 5, Gen.pure 0; 2, Gen.pure 1; 1, Gen.pure 2 ]
+
+(* The shapes a caller writes. The trailing separator is the one the primitive is
+   for; the other two mirror [blank] and [softline], and differ in whitespace
+   alone. *)
+let gen_frame_alt_leaf flavour =
+  let shapes =
+    [ 2, (Text " ", Empty); 1, (Empty, Hardline) ]
+    @ if flavour.general_flat_alt then [ 3, (Empty, Text ",") ] else []
+  in
+  Gen.map2
+    (fun i (a, b) -> Frame_alt (i, a, b))
+    gen_index
+    (Gen.oneof_weighted (List.map ~f:(fun (w, ab) -> w, Gen.pure ab) shapes))
+;;
+
 let gen flavour =
   let leaf =
     Gen.oneof_weighted
-      [ 6, Gen.map (fun s -> Text s) (gen_text flavour)
-      ; 1, Gen.pure Empty
-      ; 3, Gen.pure Line
-      ; 3, Gen.pure Softline
-      ; 1, Gen.pure Hardline
-      ; 2, Gen.pure Blank
-      ]
+      ([ 6, Gen.map (fun s -> Text s) (gen_text flavour)
+       ; 1, Gen.pure Empty
+       ; 3, Gen.pure Line
+       ; 3, Gen.pure Softline
+       ; 1, Gen.pure Hardline
+       ; 2, Gen.pure Blank
+       ]
+       @ if flavour.frames then [ 2, gen_frame_alt_leaf flavour ] else [])
   in
   let rec node n =
     if n <= 1
@@ -268,18 +393,64 @@ let gen flavour =
          @ (if flavour.general_flat_alt
             then [ 2, Gen.map2 (fun a b -> Flat_alt (a, b)) half half ]
             else [])
+         @ (if flavour.annotations
+            then
+              [ ( 2
+                , Gen.map2
+                    (fun a d -> Annot (a, d))
+                    (Gen.int_range 0 3)
+                    (Gen.sized_size (Gen.pure (n - 1)) node) )
+              ]
+            else [])
+         @ (if flavour.frames
+            then
+              [ 3, Gen.map (fun d -> Framed d) (Gen.sized_size (Gen.pure (n - 1)) node)
+                (* The shape lingo builds: the last element in a group of its
+                   own, holding a conditional on the frame around both. A
+                   conditional only follows a frame when one encloses it, and
+                   only differs from [flat_alt] when a group sits between the
+                   two, which the node above reaches by chance and this one
+                   reaches every time. *)
+              ; ( 2
+                , Gen.map3
+                    (fun d e alt -> Framed (Cat (d, Group (Cat (e, alt)))))
+                    half
+                    half
+                    (gen_frame_alt_leaf flavour) )
+              ]
+            else [])
          @
-         if flavour.annotations
-         then
-           [ ( 2
-             , Gen.map2
-                 (fun a d -> Annot (a, d))
-                 (Gen.int_range 0 3)
-                 (Gen.sized_size (Gen.pure (n - 1)) node) )
-           ]
+         if flavour.frames && flavour.general_flat_alt
+         then [ 2, Gen.map3 (fun i a b -> Frame_alt (i, a, b)) gen_index half half ]
          else []))
   in
   Gen.sized_size (Gen.int_range 1 22) node
+;;
+
+(* Frames nested up to 40 deep, with the conditionals of many of them in one
+   region: at the innermost point, the way a Lisp printer closes its brackets,
+   and here and there on the way in, with some outside every frame. The corpus
+   above seldom has more than two frames free in one region, so the tree a frame
+   keeps them in would otherwise go untried. *)
+let gen_deep =
+  let open Gen in
+  int_range 1 40
+  >>= fun depth ->
+  let cond k = map (fun i -> Frame_alt (i, Empty, Text ")")) (int_range 0 (k + 1)) in
+  let rec level k =
+    if k = depth
+    then
+      map
+        (fun cs -> Group (Concat (Text "x" :: cs)))
+        (list_size (int_range 0 (2 * depth)) (cond depth))
+    else
+      map3
+        (fun pre inner post -> Framed (Concat [ pre; Softline; inner; post ]))
+        (oneof_list [ Text "("; Text "(("; Empty ])
+        (level (k + 1))
+        (oneof [ pure Empty; cond (k + 1); map (fun c -> Group c) (cond (k + 1)) ])
+  in
+  level 0
 ;;
 
 (* Every property that varies the width runs at all of these, so a case which

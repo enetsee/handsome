@@ -48,7 +48,7 @@ let totality =
 let lines_agree =
   test
     "lines is the width of each line of to_string"
-    Surface.rich
+    Surface.wild
     (at_all_widths (fun width s ->
        let stream, _ = H.render ~width (Surface.to_doc s) in
        let bytes = H.to_string stream in
@@ -90,7 +90,7 @@ let no_trailing_whitespace =
      from outside the group, leaves one there. *)
   test
     "the engine never emits trailing indentation"
-    Surface.rich
+    Surface.wild
     (at_all_widths (fun width s ->
        let stream, _ = H.render ~width (Surface.to_doc s) in
        let rec go = function

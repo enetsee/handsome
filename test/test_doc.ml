@@ -1,6 +1,7 @@
 (* The document type. The derived breaks are the flat_alts they are defined to
-   be, [check] rejects exactly the documents with a newline in a text node, and
-   [pp] preserves enough structure to be read back. *)
+   be, [check] rejects exactly the documents with a newline in a text node or a
+   conditional outside its frame, and [pp] preserves enough structure to
+   be read back. *)
 
 open StdLabels
 module H = Handsome.Ascii
@@ -28,7 +29,8 @@ let check_agrees_with_ground_truth =
      this test carries both halves of the law: the documents rejected are exactly
      those holding one, and the nodes named are exactly those that do. *)
   test
-    "check rejects a document iff a text node contains a newline"
+    "check rejects a document iff a text node contains a newline or a conditional \
+     outside its frame"
     Surface.dirty
     (fun s ->
        let expected = Surface.offenders s in
@@ -37,7 +39,13 @@ let check_agrees_with_ground_truth =
        | Error es, _ :: _ ->
          List.length es = List.length expected
          && List.for_all2
-              ~f:(fun (e : H.error) (text, index) -> e.text = text && e.index = index)
+              ~f:(fun (e : H.error) o ->
+                match e, o with
+                | Newline_in_text e, Surface.Newline (text, index) ->
+                  e.text = text && e.index = index
+                | Alt_outside_frame n, Surface.Outside m -> n = m
+                | Newline_in_text _, Surface.Outside _
+                | Alt_outside_frame _, Surface.Newline _ -> false)
               es
               expected
        | Ok (), _ :: _ | Error _, [] -> false)
@@ -103,10 +111,11 @@ let unit_cases =
     , fun () ->
         match H.check (H.text "a" ^^ H.text "b\nc") with
         | Ok () -> Alcotest.fail "expected a rejection"
-        | Error [ e ] ->
-          eq "text" e.H.text "b\nc";
-          Alcotest.(check int) "index" 1 e.H.index
-        | Error es -> Alcotest.failf "expected one error, got %d" (List.length es) )
+        | Error [ H.Newline_in_text e ] ->
+          eq "text" e.text "b\nc";
+          Alcotest.(check int) "index" 1 e.index
+        | Error es ->
+          Alcotest.failf "expected one newline, got %d errors" (List.length es) )
   ]
 ;;
 

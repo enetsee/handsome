@@ -9,9 +9,9 @@ module Width = struct
     val compare : t -> t -> int
 
     (* [measure] must report at least the display width, must be additive over
-     concatenation, and must measure the empty string at [zero]. A document's 
-     width is the sum of its text nodes', computed at construction and held from 
-     then on. *)
+     concatenation, and must measure the empty string at [zero]. [add] must be
+     associative and commutative. A document's width is the sum of its text
+     nodes', computed at construction and held from then on. *)
     val measure : string -> t
   end
 end
@@ -92,9 +92,11 @@ module type S = sig
   type 'a t
 
   type error =
-    { text : string
-    ; index : int
-    }
+    | Newline_in_text of
+        { text : string
+        ; index : int
+        }
+    | Alt_outside_frame of int
 
   val text : string -> 'a t
   val empty : 'a t
@@ -108,6 +110,7 @@ module type S = sig
   val group : 'a t -> 'a t
   val nest : int -> 'a t -> 'a t
   val align : 'a t -> 'a t
+  val framed : (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
   val annotate : 'a -> 'a t -> 'a t
   val reannotate : ('a -> 'b) -> 'a t -> 'b t
   val unannotate : 'a t -> unit t
@@ -138,6 +141,8 @@ module Make (W : Width.S) = struct
      with a flag saying whether a flat layout exists at all: a hardline in flat
      position rules one out. The fit decision at a group is then a comparison
      against a value already present, and rendering is linear in the document.
+     A frame and each of its conditionals add a lookup in the set of frames laid
+     out flat, logarithmic in its size.
 
      The two are fields of an inline record, a [bool] and a [W.t], with the
      [W.t] a placeholder where the [bool] is false. The alternative encoding is
@@ -164,6 +169,229 @@ module Make (W : Width.S) = struct
      [flattenable] and the fit test in [step] are the only readers of these
      fields, and both consult the flag first.
      ------------------------------------------------------------------------ *)
+
+  (* A frame's name. [framed] takes a fresh one for each frame and hands the
+     caller its conditional, so no caller names a tag directly. *)
+  type tag = int
+
+  module Tag_set = Set.Make (Int)
+
+  (* -- frames -------------------------------------------------------------------
+
+     A group decides whether it fits only when nothing around it is flat: a
+     flat group or frame puts everything inside it in flat mode, where no
+     decision is made. So whenever a group decides, every frame around it has
+     already broken, and a conditional whose frame lies outside the deciding
+     group takes its broken branch. One whose frame lies inside takes its flat
+     branch if the group goes flat, because the frame goes flat with it.
+
+     Every node therefore caches its width with each free conditional -- one
+     whose frame is further out -- at its broken branch, and that width is the
+     one the node prints. The frame is the one node that has to see the other
+     branch, and a [Free] node carries what it needs: it sits over a region
+     holding free conditionals, and records per frame what their flat and
+     broken branches weigh. [frame] reads its own frame's entry, measures those
+     conditionals at their flat branch, and passes the rest further out. A
+     conditional with no frame at all takes its broken branch, which is what it
+     was measured at.
+
+     One case is measured conservatively. Inside a branch of a conditional, a
+     conditional free in that branch counts at the wider of its two branches.
+     Whether it is printed depends on the frame of the conditional holding it
+     as well as on its own, and measuring it exactly means carrying it through
+     every frame between it and the root under each combination of the two.
+     Done directly that is quadratic in the depth of the nesting, and
+     exponential where one subdocument sits in both branches of nested
+     conditionals.
+
+     The entries are kept in a balanced tree keyed by tag, whose nodes hold the
+     sums over their subtrees. [W] has no subtraction, so a frame takes "every
+     frame's conditionals but mine" by removing its own entry and reading the
+     root. A frame then costs O(log k) for k frames free in its body, a
+     conditional costs O(1), and [( ^^ )] adds the smaller side's entries to the
+     larger's, so a document of n nodes, counted as a tree, is built in
+     O(n log^2 n) at most.
+
+     Summing by frame adds widths out of document order, which is why [add]
+     has to be commutative.
+
+     [Free] never wraps a [Free]. A [Free] can also sit where its entries go no
+     further up: in the broken branch of a [flat_alt], which no group around it
+     measures, and in a branch of a conditional, which is measured at its
+     widest. A document built without [framed] holds none, so documents without
+     frames are built exactly as before.
+     ------------------------------------------------------------------------ *)
+
+  (* What one frame's free conditionals weigh in a region: at their flat
+     branches, at their broken branches, and each at whichever of its two is
+     wider. The [_ok] flags say whether those branches can lie flat. *)
+  type free =
+    { flat_w : W.t
+    ; flat_ok : bool
+    ; broken_w : W.t
+    ; broken_ok : bool
+    ; wider_w : W.t
+    }
+
+  (* An AVL tree of [free]s keyed by tag. Each node also holds its subtree's
+     size, for choosing the smaller side of a union, and the sums over its
+     subtree at the broken branch and at the wider one. *)
+  type frees =
+    | F_leaf
+    | F_node of
+        { l : frees
+        ; tag : tag
+        ; e : free
+        ; r : frees
+        ; height : int
+        ; size : int
+        ; all_broken_w : W.t
+        ; all_broken_ok : bool
+        ; all_wider_w : W.t
+        ; all_wider_ok : bool
+        }
+
+  let f_height = function
+    | F_leaf -> 0
+    | F_node n -> n.height
+  ;;
+
+  let f_size = function
+    | F_leaf -> 0
+    | F_node n -> n.size
+  ;;
+
+  let broken_w_of = function
+    | F_leaf -> W.zero
+    | F_node n -> n.all_broken_w
+  ;;
+
+  let broken_ok_of = function
+    | F_leaf -> true
+    | F_node n -> n.all_broken_ok
+  ;;
+
+  let wider_w_of = function
+    | F_leaf -> W.zero
+    | F_node n -> n.all_wider_w
+  ;;
+
+  let wider_ok_of = function
+    | F_leaf -> true
+    | F_node n -> n.all_wider_ok
+  ;;
+
+  let f_node l tag e r =
+    F_node
+      { l
+      ; tag
+      ; e
+      ; r
+      ; height = 1 + Int.max (f_height l) (f_height r)
+      ; size = f_size l + 1 + f_size r
+      ; all_broken_w = W.add (W.add (broken_w_of l) e.broken_w) (broken_w_of r)
+      ; all_broken_ok = broken_ok_of l && e.broken_ok && broken_ok_of r
+      ; all_wider_w = W.add (W.add (wider_w_of l) e.wider_w) (wider_w_of r)
+      ; all_wider_ok = wider_ok_of l && e.flat_ok && e.broken_ok && wider_ok_of r
+      }
+  ;;
+
+  (* Rebalances a node whose subtrees differ in height by at most three, as
+     [Stdlib.Map] does. A subtree two taller than its sibling is a node, so the
+     [F_leaf] cases are unreachable. *)
+  let f_balance l tag e r =
+    let hl = f_height l
+    and hr = f_height r in
+    if hl > hr + 2
+    then (
+      match l with
+      | F_leaf -> assert false
+      | F_node ln ->
+        if f_height ln.l >= f_height ln.r
+        then f_node ln.l ln.tag ln.e (f_node ln.r tag e r)
+        else (
+          match ln.r with
+          | F_leaf -> assert false
+          | F_node lr ->
+            f_node (f_node ln.l ln.tag ln.e lr.l) lr.tag lr.e (f_node lr.r tag e r)))
+    else if hr > hl + 2
+    then (
+      match r with
+      | F_leaf -> assert false
+      | F_node rn ->
+        if f_height rn.r >= f_height rn.l
+        then f_node (f_node l tag e rn.l) rn.tag rn.e rn.r
+        else (
+          match rn.l with
+          | F_leaf -> assert false
+          | F_node rl ->
+            f_node (f_node l tag e rl.l) rl.tag rl.e (f_node rl.r rn.tag rn.e rn.r)))
+    else f_node l tag e r
+  ;;
+
+  let combine x y =
+    { flat_w = W.add x.flat_w y.flat_w
+    ; flat_ok = x.flat_ok && y.flat_ok
+    ; broken_w = W.add x.broken_w y.broken_w
+    ; broken_ok = x.broken_ok && y.broken_ok
+    ; wider_w = W.add x.wider_w y.wider_w
+    }
+  ;;
+
+  (* Adds [e] under [tag], summing it into the entry already there. *)
+  let rec f_add tag e = function
+    | F_leaf -> f_node F_leaf tag e F_leaf
+    | F_node n ->
+      let c = Int.compare tag n.tag in
+      if c = 0
+      then f_node n.l tag (combine n.e e) n.r
+      else if c < 0
+      then f_balance (f_add tag e n.l) n.tag n.e n.r
+      else f_balance n.l n.tag n.e (f_add tag e n.r)
+  ;;
+
+  let rec f_find tag = function
+    | F_leaf -> None
+    | F_node n ->
+      let c = Int.compare tag n.tag in
+      if c = 0 then Some n.e else f_find tag (if c < 0 then n.l else n.r)
+  ;;
+
+  let rec f_remove_min = function
+    | F_leaf -> assert false
+    | F_node { l = F_leaf; tag; e; r; _ } -> tag, e, r
+    | F_node ({ l = F_node _; _ } as n) ->
+      let tag, e, l = f_remove_min n.l in
+      tag, e, f_balance l n.tag n.e n.r
+  ;;
+
+  let f_join l r =
+    match l, r with
+    | F_leaf, t | t, F_leaf -> t
+    | F_node _, F_node _ ->
+      let tag, e, r = f_remove_min r in
+      f_balance l tag e r
+  ;;
+
+  let rec f_remove tag = function
+    | F_leaf -> F_leaf
+    | F_node n ->
+      let c = Int.compare tag n.tag in
+      if c = 0
+      then f_join n.l n.r
+      else if c < 0
+      then f_balance (f_remove tag n.l) n.tag n.e n.r
+      else f_balance n.l n.tag n.e (f_remove tag n.r)
+  ;;
+
+  let rec f_add_all t into =
+    match t with
+    | F_leaf -> into
+    | F_node n -> f_add_all n.r (f_add n.tag n.e (f_add_all n.l into))
+  ;;
+
+  (* The smaller side's entries added to the larger's. *)
+  let f_union x y = if f_size x <= f_size y then f_add_all x y else f_add_all y x
 
   type 'a t =
     | Empty
@@ -205,11 +433,44 @@ module Make (W : Width.S) = struct
         ; a : 'a
         ; d : 'a t
         }
+    (* A group that records how it resolved under [tag], and a conditional that
+       reads that record where [Alt] reads the group directly enclosing it.
+       [Frame]'s requirement has its own conditionals at their flat branch, and
+       [Falt]'s is its broken branch's; see above. *)
+    | Frame of
+        { flattenable : bool
+        ; req : W.t
+        ; tag : tag
+        ; d : 'a t
+        }
+    | Falt of
+        { flattenable : bool
+        ; req : W.t
+        ; tag : tag
+        ; f : 'a t
+        ; b : 'a t
+        }
+    | Free of 'a region
+
+  (* [fixed] and [fixed_ok] measure what the free conditionals leave alone.
+     [all_w] and [all_ok] measure the whole, the free conditionals at their
+     broken branch, and are copied from [inside]'s own fields, so that reading a
+     region's measure is one field away. [inside] is never a [Free]. *)
+  and 'a region =
+    { fixed : W.t
+    ; fixed_ok : bool
+    ; frees : frees
+    ; inside : 'a t
+    ; all_w : W.t
+    ; all_ok : bool
+    }
 
   type error =
-    { text : string
-    ; index : int
-    }
+    | Newline_in_text of
+        { text : string
+        ; index : int
+        }
+    | Alt_outside_frame of int
 
   (* [flat_width] carries a width where [flattenable] is true, and a placeholder
      on [Hard] and on anything holding it in flat position. *)
@@ -223,6 +484,9 @@ module Make (W : Width.S) = struct
     | Nest r -> r.flattenable
     | Align r -> r.flattenable
     | Annot r -> r.flattenable
+    | Frame r -> r.flattenable
+    | Falt r -> r.flattenable
+    | Free r -> r.all_ok
   ;;
 
   let flat_width = function
@@ -234,6 +498,9 @@ module Make (W : Width.S) = struct
     | Nest r -> r.req
     | Align r -> r.req
     | Annot r -> r.req
+    | Frame r -> r.req
+    | Falt r -> r.req
+    | Free r -> r.all_w
   ;;
 
   (* -- constructors -------------------------------------------------------- *)
@@ -246,7 +513,94 @@ module Make (W : Width.S) = struct
      in a single place. *)
   let is_empty = function
     | Empty -> true
-    | Text _ | Hard | Cat _ | Alt _ | Group _ | Nest _ | Align _ | Annot _ -> false
+    | Text _
+    | Hard
+    | Cat _
+    | Alt _
+    | Group _
+    | Nest _
+    | Align _
+    | Annot _
+    | Frame _
+    | Falt _
+    | Free _ -> false
+  ;;
+
+  let is_free = function
+    | Free _ -> true
+    | Empty
+    | Text _
+    | Hard
+    | Cat _
+    | Alt _
+    | Group _
+    | Nest _
+    | Align _
+    | Annot _
+    | Frame _
+    | Falt _ -> false
+  ;;
+
+  (* [d] seen as a region: its own, or, where nothing in it is free, one that
+     is all fixed. The second allocates, so the constructors ask [is_free]
+     before they ask for this. *)
+  let view d =
+    match d with
+    | Free r -> r
+    | Empty
+    | Text _
+    | Hard
+    | Cat _
+    | Alt _
+    | Group _
+    | Nest _
+    | Align _
+    | Annot _
+    | Frame _
+    | Falt _ ->
+      let w = flat_width d
+      and ok = flattenable d in
+      { fixed = w; fixed_ok = ok; frees = F_leaf; inside = d; all_w = w; all_ok = ok }
+  ;;
+
+  (* [d], which is never a [Free], as a region with these parts, or [d] itself
+     where nothing is free. *)
+  let region fixed fixed_ok frees d =
+    match frees with
+    | F_leaf -> d
+    | F_node _ ->
+      Free
+        { fixed
+        ; fixed_ok
+        ; frees
+        ; inside = d
+        ; all_w = flat_width d
+        ; all_ok = flattenable d
+        }
+  ;;
+
+  (* The region [r] around a new node built over its [inside]. *)
+  let rewrap r d =
+    Free { r with inside = d; all_w = flat_width d; all_ok = flattenable d }
+  ;;
+
+  let wider x y = if W.compare x y >= 0 then x else y
+
+  (* [d] with every free conditional at its wider branch, and whether all of
+     their branches lie flat. This is how a conditional measures its branches;
+     see the comment above [free]. *)
+  let widest d =
+    if is_free d
+    then (
+      let r = view d in
+      W.add r.fixed (wider_w_of r.frees), r.fixed_ok && wider_ok_of r.frees)
+    else flat_width d, flattenable d
+  ;;
+
+  let[@inline] cat x y =
+    let flattenable = flattenable x && flattenable y in
+    let req = if flattenable then W.add (flat_width x) (flat_width y) else W.zero in
+    Cat { flattenable; req; l = x; r = y }
   ;;
 
   let ( ^^ ) x y =
@@ -254,10 +608,16 @@ module Make (W : Width.S) = struct
     then y
     else if is_empty y
     then x
-    else (
-      let flattenable = flattenable x && flattenable y in
-      let req = if flattenable then W.add (flat_width x) (flat_width y) else W.zero in
-      Cat { flattenable; req; l = x; r = y })
+    else if is_free x || is_free y
+    then (
+      let rx = view x
+      and ry = view y in
+      region
+        (W.add rx.fixed ry.fixed)
+        (rx.fixed_ok && ry.fixed_ok)
+        (f_union rx.frees ry.frees)
+        (cat rx.inside ry.inside))
+    else cat x y
   ;;
 
   (* Reversing first and folding left builds the same right-leaning tree as
@@ -266,12 +626,24 @@ module Make (W : Width.S) = struct
 
   (* The cached width of [flat_alt a b] is that of [a], the branch taken when
      laid out flat, which is why a hardline in the flat branch leaves every
-     enclosing group broken. *)
-  let flat_alt a b = Alt { flattenable = flattenable a; req = flat_width a; f = a; b }
+     enclosing group broken. For the same reason only [a]'s free conditionals
+     reach the region above: [b] is printed only where the group around the
+     [flat_alt] broke, and no group around it measures [b]. *)
+  let alt a b = Alt { flattenable = flattenable a; req = flat_width a; f = a; b }
+
+  let flat_alt a b =
+    if is_free a
+    then (
+      let r = view a in
+      rewrap r (alt r.inside b))
+    else alt a b
+  ;;
+
   let hardline = Hard
   let line = flat_alt (text " ") hardline
   let softline = flat_alt empty hardline
   let blank = flat_alt (text " ") empty
+  let group_node d = Group { flattenable = true; req = flat_width d; d }
 
   (* A group holding a hardline in flat position is dropped: it would always be
      laid out broken. The output is identical either way, and [pp] and the
@@ -279,22 +651,104 @@ module Make (W : Width.S) = struct
   let group d =
     if is_empty d || not (flattenable d)
     then d
-    else Group { flattenable = true; req = flat_width d; d }
+    else if is_free d
+    then (
+      let r = view d in
+      rewrap r (group_node r.inside))
+    else group_node d
   ;;
+
+  (* Generated, so no two frames share a tag and a document carries its own
+     scoping. Atomic, so two domains building documents at once never take the
+     same one. *)
+  let next_tag = Atomic.make 0
+  let new_tag () = Atomic.fetch_and_add next_tag 1
+
+  (* A frame measures its own conditionals at their flat branch, which is the
+     branch they take whenever it is laid out flat, and leaves the rest free.
+
+     Unlike [group], this keeps its node when [d] holds a hardline. A frame
+     laid out broken binds nothing, so its conditionals take their broken
+     branch, as a conditional with no frame does, and the output would be the
+     same without the node. [check] would then report the conditionals inside
+     as outside their frame. *)
+  let frame tag d =
+    if is_empty d
+    then d
+    else (
+      let r = view d in
+      let fixed, fixed_ok =
+        match f_find tag r.frees with
+        | Some own -> W.add r.fixed own.flat_w, r.fixed_ok && own.flat_ok
+        | None -> r.fixed, r.fixed_ok
+      in
+      let rest = f_remove tag r.frees in
+      let flattenable = fixed_ok && broken_ok_of rest in
+      let req = if flattenable then W.add fixed (broken_w_of rest) else W.zero in
+      region fixed fixed_ok rest (Frame { flattenable; req; tag; d = r.inside }))
+  ;;
+
+  (* A conditional is free until its frame, so it is measured at its broken
+     branch, and its region records both branches for the frame. Each branch is
+     measured at its widest; see the comment above [free]. *)
+  let frame_alt tag a b =
+    let flat_w, flat_ok = widest a
+    and broken_w, broken_ok = widest b in
+    let e = { flat_w; flat_ok; broken_w; broken_ok; wider_w = wider flat_w broken_w } in
+    let req = if broken_ok then broken_w else W.zero in
+    Free
+      { fixed = W.zero
+      ; fixed_ok = true
+      ; frees = f_node F_leaf tag e F_leaf
+      ; inside = Falt { flattenable = broken_ok; req; tag; f = a; b }
+      ; all_w = req
+      ; all_ok = broken_ok
+      }
+  ;;
+
+  (* The tag is taken before the body is built, because the conditionals that
+     read it are inside. The callback is what keeps them inside: [alt] exists
+     only while the frame's body is being built. *)
+  let framed body =
+    let tag = new_tag () in
+    frame tag (body (frame_alt tag))
+  ;;
+
+  let nest_node j d = Nest { flattenable = flattenable d; req = flat_width d; j; d }
 
   let nest j d =
     if is_empty d || j = 0
     then d
-    else Nest { flattenable = flattenable d; req = flat_width d; j; d }
+    else if is_free d
+    then (
+      let r = view d in
+      rewrap r (nest_node j r.inside))
+    else nest_node j d
   ;;
 
+  let align_node d = Align { flattenable = flattenable d; req = flat_width d; d }
+
   let align d =
-    if is_empty d then d else Align { flattenable = flattenable d; req = flat_width d; d }
+    if is_empty d
+    then d
+    else if is_free d
+    then (
+      let r = view d in
+      rewrap r (align_node r.inside))
+    else align_node d
   ;;
 
   (* Kept for [Empty] as well. An annotated empty region is a position in the
      stream, which a source map can use. *)
-  let annotate a d = Annot { flattenable = flattenable d; req = flat_width d; a; d }
+  let annotate_node a d = Annot { flattenable = flattenable d; req = flat_width d; a; d }
+
+  let annotate a d =
+    if is_free d
+    then (
+      let r = view d in
+      rewrap r (annotate_node a r.inside))
+    else annotate_node a d
+  ;;
 
   (* Both rebuild through the smart constructors. [unannotate] can turn a
      non-empty region into an empty one, and the constructors restore the
@@ -311,17 +765,21 @@ module Make (W : Width.S) = struct
      grows the main fibre's stack on demand and hides it, which is why
      [test/test_depth.ml] runs under a cap.
 
-     The continuation is defunctionalised, one frame per node on the way down and
-     one step back up per frame. A frame holds the sibling it is still waiting
+     The continuation is defunctionalised, one entry per node on the way down and
+     one step back up per entry. An entry holds the sibling it is still waiting
      for, and once that sibling is finished it holds the finished term instead:
      [R_cat_todo] carries a child still to visit, [R_cat_done] the child already
-     rebuilt. Because the finished term lives in the frame, every match here is
-     exhaustive: a frame and its operands always agree, so there is no case to
+     rebuilt. Because the finished term lives in the entry, every match here is
+     exhaustive: an entry and its operands always agree, so there is no case to
      rule out.
 
-     [reannotate]'s ['a -> 'b] is why a frame's two halves have different types.
-     [unannotate] shares the frames and pushes no [R_annot]: it drops the
-     annotation, so its child's result is the node's result. *)
+     [reannotate]'s ['a -> 'b] is why an entry's two halves have different
+     types. [unannotate] shares the entries and pushes no [R_annot]: it drops
+     the annotation, so its child's result is the node's result.
+
+     A rebuilt [Frame] or [Falt] keeps its tag. A fresh one would leave the
+     conditionals inside looking for a group that is gone. A [Free] node is
+     passed through: the constructors on the way back up put it back. *)
   type ('a, 'b) rebuild =
     | R_done
     | R_cat_todo of 'a t * ('a, 'b) rebuild
@@ -332,6 +790,9 @@ module Make (W : Width.S) = struct
     | R_nest of int * ('a, 'b) rebuild
     | R_align of ('a, 'b) rebuild
     | R_annot of 'b * ('a, 'b) rebuild
+    | R_frame of tag * ('a, 'b) rebuild
+    | R_falt_todo of tag * 'a t * ('a, 'b) rebuild
+    | R_falt_done of tag * 'b t * ('a, 'b) rebuild
 
   let reannotate fn d =
     let rec down d k =
@@ -345,6 +806,9 @@ module Make (W : Width.S) = struct
       | Nest r -> down r.d (R_nest (r.j, k))
       | Align r -> down r.d (R_align k)
       | Annot r -> down r.d (R_annot (fn r.a, k))
+      | Frame r -> down r.d (R_frame (r.tag, k))
+      | Falt r -> down r.f (R_falt_todo (r.tag, r.b, k))
+      | Free r -> down r.inside k
     and up v k =
       match k with
       | R_done -> v
@@ -356,6 +820,9 @@ module Make (W : Width.S) = struct
       | R_nest (j, k) -> up (nest j v) k
       | R_align k -> up (align v) k
       | R_annot (a, k) -> up (annotate a v) k
+      | R_frame (tag, k) -> up (frame tag v) k
+      | R_falt_todo (tag, b, k) -> down b (R_falt_done (tag, v, k))
+      | R_falt_done (tag, f, k) -> up (frame_alt tag f v) k
     in
     down d R_done
   ;;
@@ -373,6 +840,9 @@ module Make (W : Width.S) = struct
       | Nest r -> down r.d (R_nest (r.j, k))
       | Align r -> down r.d (R_align k)
       | Annot r -> down r.d k
+      | Frame r -> down r.d (R_frame (r.tag, k))
+      | Falt r -> down r.f (R_falt_todo (r.tag, r.b, k))
+      | Free r -> down r.inside k
     and up v k =
       match k with
       | R_done -> v
@@ -384,39 +854,80 @@ module Make (W : Width.S) = struct
       | R_nest (j, k) -> up (nest j v) k
       | R_align k -> up (align v) k
       | R_annot ((), k) -> up v k
+      | R_frame (tag, k) -> up (frame tag v) k
+      | R_falt_todo (tag, b, k) -> down b (R_falt_done (tag, v, k))
+      | R_falt_done (tag, f, k) -> up (frame_alt tag f v) k
     in
     down d R_done
   ;;
 
   (* -- checking ------------------------------------------------------------ *)
 
+  (* Numbers tags from 0 in the order they are first met. [check] and [pp] walk a
+     document in the same order, so they give every tag the same number, and a
+     conditional [check] reports can be found in [pp]'s output. *)
+  let numbering () =
+    let names = Hashtbl.create 8 in
+    fun tag ->
+      match Hashtbl.find_opt names tag with
+      | Some n -> n
+      | None ->
+        let n = Hashtbl.length names in
+        Hashtbl.add names tag n;
+        n
+  ;;
+
+  (* The worklist closes each frame after its body, putting back the scope it
+     found, so [scope] holds the frames open at the node in hand. *)
+  type 'a check_step =
+    | Check of 'a t
+    | Close of Tag_set.t
+
   let check d =
     let errs = ref [] in
+    let number = numbering () in
+    let scope = ref Tag_set.empty in
     let rec go = function
       | [] -> ()
-      | d :: rest ->
+      | Close outer :: rest ->
+        scope := outer;
+        go rest
+      | Check d :: rest ->
         (match d with
          | Empty | Hard -> go rest
          | Text (_, s) ->
            (match String.index_opt s '\n' with
-            | Some i -> errs := { text = s; index = i } :: !errs
+            | Some i -> errs := Newline_in_text { text = s; index = i } :: !errs
             | None -> ());
            go rest
-         | Cat r -> go (r.l :: r.r :: rest)
-         | Alt r -> go (r.f :: r.b :: rest)
-         | Group r -> go (r.d :: rest)
-         | Nest r -> go (r.d :: rest)
-         | Align r -> go (r.d :: rest)
-         | Annot r -> go (r.d :: rest))
+         | Cat r -> go (Check r.l :: Check r.r :: rest)
+         | Alt r -> go (Check r.f :: Check r.b :: rest)
+         | Group r -> go (Check r.d :: rest)
+         | Nest r -> go (Check r.d :: rest)
+         | Align r -> go (Check r.d :: rest)
+         | Annot r -> go (Check r.d :: rest)
+         | Frame r ->
+           ignore (number r.tag : int);
+           let outer = !scope in
+           scope := Tag_set.add r.tag outer;
+           go (Check r.d :: Close outer :: rest)
+         | Falt r ->
+           let n = number r.tag in
+           if not (Tag_set.mem r.tag !scope) then errs := Alt_outside_frame n :: !errs;
+           go (Check r.f :: Check r.b :: rest)
+         | Free r -> go (Check r.inside :: rest))
     in
-    go [ d ];
+    go [ Check d ];
     match !errs with
     | [] -> Ok ()
     | es -> Error (List.rev es)
   ;;
 
-  let pp_error ppf { text; index } =
-    Format.fprintf ppf "newline at byte %d of text node %S" index text
+  let pp_error ppf = function
+    | Newline_in_text { text; index } ->
+      Format.fprintf ppf "newline at byte %d of text node %S" index text
+    | Alt_outside_frame n ->
+      Format.fprintf ppf "(frame-alt %d ...) outside any (frame %d ...)" n n
   ;;
 
   (* -- printing the document structure ------------------------------------- *)
@@ -434,7 +945,12 @@ module Make (W : Width.S) = struct
 
      One box per node is still open at the deepest point, so depth costs heap
      inside [Format] as well as here. The renderer makes the same trade. The heap
-     grows on demand where the stack has a fixed limit. *)
+     grows on demand where the stack has a fixed limit.
+
+     A tag prints as a number local to the printout, counted from 0 in order of
+     first appearance. The value [new_tag] handed out depends on how many tags
+     the process took before it, so printing that would make the same document
+     print differently from one run to the next. *)
   type 'a pp_step =
     | Pp_doc of 'a t
     | Pp_text of string
@@ -445,6 +961,11 @@ module Make (W : Width.S) = struct
     let enter name =
       Format.pp_open_hovbox ppf 1;
       Format.pp_print_string ppf name
+    in
+    let number = numbering () in
+    let print_tag tag =
+      Format.pp_print_space ppf ();
+      Format.pp_print_int ppf (number tag)
     in
     let rec go = function
       | [] -> ()
@@ -501,7 +1022,23 @@ module Make (W : Width.S) = struct
            go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
          | Annot r ->
            enter "(annotate";
-           go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k))
+           go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
+         | Frame r ->
+           enter "(frame";
+           print_tag r.tag;
+           go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
+         | Falt r ->
+           enter "(frame-alt";
+           print_tag r.tag;
+           go
+             (Pp_space
+              :: Pp_doc r.f
+              :: Pp_space
+              :: Pp_doc r.b
+              :: Pp_text ")"
+              :: Pp_close
+              :: k)
+         | Free r -> go (Pp_doc r.inside :: k))
     in
     go [ Pp_doc d ]
   ;;
@@ -673,11 +1210,11 @@ module Make (W : Width.S) = struct
 
   (* -- the renderer -----------------------------------------------------------
 
-     State is one mutable record, saved and restored around [nest], [align] and
-     [group] by frames on an explicit continuation. The continuation is held in
-     the record as well, so the exception handler in [drive] can see where the
-     failure occurred. The engine is tail-recursive throughout, so document depth
-     costs heap and leaves the stack flat. That holds of every traversal in the
+     State is one mutable record, saved and restored around [nest], [align],
+     [group] and [framed] by entries on an explicit continuation. The
+     continuation is held in the record as well, so the exception handler in
+     [drive] can see where the failure occurred. The engine is tail-recursive
+     throughout, so document depth costs heap and leaves the stack flat. That holds of every traversal in the
      library: [check] walks a worklist, and [reannotate], [unannotate] and [pp]
      defunctionalise their continuations, for the reason given above
      [reannotate]. [test/test_depth.ml] tests all five.
@@ -708,6 +1245,10 @@ module Make (W : Width.S) = struct
     | KRestore of int * bool * 'a kont
     | KPop of 'a kont
     | KGroup of snap * 'a t * 'a kont
+    (* The frames laid out flat that were open before a [Frame] laid out flat,
+       put back on the way out. The set is persistent, so capturing it is a
+       pointer. *)
+    | KFrames of Tag_set.t * 'a kont
 
   type 'a state =
     { ruler : W.t
@@ -726,6 +1267,11 @@ module Make (W : Width.S) = struct
          [resolutions.declined] so that neither record's fields are resolved by
          type-directed disambiguation. *)
       mutable declined_rev : (int * W.t) list
+    ; (* The frames open at this point that were laid out flat. A [Falt] reads
+         its tag here where an [Alt] reads [flat]. A frame laid out broken is
+         left out, and its conditionals, finding no binding, take their broken
+         branch. *)
+      mutable flat_frames : Tag_set.t
     ; mutable k : 'a kont
     }
 
@@ -810,6 +1356,10 @@ module Make (W : Width.S) = struct
       st.flat <- s.s_flat;
       st.k <- k;
       run st
+    | KFrames (fs, k) ->
+      st.flat_frames <- fs;
+      st.k <- k;
+      run st
 
   and step st d =
     match d with
@@ -866,12 +1416,55 @@ module Make (W : Width.S) = struct
           st.flat <- true;
           st.k <- KGroup (s, r.d, st.k);
           step st r.d))
+    | Frame r ->
+      if st.flat
+      then (
+        (* Inside a group or frame laid out flat, so this one is flat too. *)
+        st.k <- KFrames (st.flat_frames, st.k);
+        st.flat_frames <- Tag_set.add r.tag st.flat_frames;
+        step st r.d)
+      else if not r.flattenable
+      then (* A hardline inside it, so it is laid out broken. *)
+        step st r.d
+      else (
+        let fits = W.compare (W.add st.column r.req) st.ruler <= 0 in
+        if not fits
+        then step st r.d
+        else (
+          (* [KFrames] goes above [KGroup], so that the rewind in [drive] finds
+             the frames that were flat before this one. *)
+          let s = snapshot st in
+          st.flat <- true;
+          st.k <- KGroup (s, r.d, st.k);
+          st.k <- KFrames (st.flat_frames, st.k);
+          st.flat_frames <- Tag_set.add r.tag st.flat_frames;
+          step st r.d))
+    | Falt r ->
+      (* A conditional takes its flat branch where its frame is open and was
+         laid out flat, and its broken branch anywhere else, which is the branch
+         every group around it measured. One resolved flat is recorded as a
+         [flat_alt] is: it is a choice the engine made flat, and its broken
+         branch can hold a break. *)
+      if Tag_set.mem r.tag st.flat_frames
+      then (
+        st.declined_rev <- (st.line, st.column) :: st.declined_rev;
+        step st r.f)
+      else step st r.b
+    | Free r -> step st r.inside
   ;;
 
-  let rec unwind = function
-    | KNil -> KNil
-    | KGroup _ as k -> k
-    | KDoc (_, k) | KRestore (_, _, k) | KPop k -> unwind k
+  (* The [KGroup] that entered flat mode, and the frames that were flat when it
+     did. A frame opened since then and still open left the set it found on a
+     [KFrames]; the one nearest the [KGroup] was the first opened, and found
+     the set the snapshot saw. A frame opened and closed since then put the set
+     back. So where no [KFrames] lies above the [KGroup], the set in hand is
+     the one the snapshot saw. The snapshot does not carry it, which saves a
+     word on every group that fits. *)
+  let rec unwind before = function
+    | KNil -> None
+    | KGroup (s, d, k) -> Some (s, d, k, before)
+    | KFrames (fs, k) -> unwind (Some fs) k
+    | KDoc (_, k) | KRestore (_, _, k) | KPop k -> unwind before k
   ;;
 
   (* Recovery from a hardline reached in flat mode. Flat mode is entered where
@@ -881,11 +1474,18 @@ module Make (W : Width.S) = struct
 
      The recovery is local. It unwinds to the group that chose flat, undoes
      everything that group emitted, and lays it out broken; frames above the
-     group are left as they were.
+     group are left as they were. The frames laid out flat since go with the
+     rest: [unwind] finds the set from before them. Where the group that chose
+     flat is itself a frame, its conditionals then have no binding and take
+     their broken branch, which is what a frame laid out broken gives them.
 
      Making [Hard] flattenable brings flat mode within reach of a hardline and
-     fires this on most of the test corpus, with the whole suite still passing.
-     So the recovery produces the correct layout when it runs.
+     fires this on most of the test corpus. Every document still renders as the
+     reference says, apart from the one case measured conservatively: a
+     conditional in another's branch, free there, with a hardline in one of its
+     branches. The rule lays that out broken, and the edit lets it lay out flat
+     and take the other branch, never reaching here. So the recovery produces
+     the correct layout when it runs.
 
      TODO: decide whether this stays; the question is still open. The branch
      cannot run, so its cost buys nothing today: [snapshot] allocates nine words
@@ -903,14 +1503,20 @@ module Make (W : Width.S) = struct
      type revisited, and a fresh look at what [hardline-is-flattenable] reddens
      once there is nothing left to recover.
 
-     The unreachability is checked. [st.flat] is set true in one place, a
-     [Group] node is built in one place and only behind [flattenable], and
-     ['a t] is abstract, so no caller can build one another way. Recomputing the
-     flag from the structure alone, trusting no cached field, agreed with it at
-     2.1M subterms of 200k generated documents built to break it, and nothing
-     arrived here across 2.2M renders. [flat-violation-unreachable] reddens
-     nothing in the suite. The gap in all that is a later constructor whose
-     [flattenable] does not propagate, which is the case this branch is for. *)
+     The unreachability is checked. [st.flat] is set true in two places, at a
+     [Group] and at a [Frame]. A [Group] node is built in one place and only
+     behind [flattenable], a [Frame] enters flat mode only behind its own flag,
+     and ['a t] is abstract, so no caller can build one another way. A frame's
+     conditional counts as flattenable where the branch that flat mode gives it
+     is: the broken one for a group between it and its frame, the flat one for
+     the frame and the groups around it, and both inside another conditional's
+     branch. That keeps the argument true of it. Recomputing the flag from
+     the structure alone, trusting no cached field, agreed with it at 2.1M
+     subterms of 200k generated documents built to break it, and nothing arrived
+     here across 2.2M renders; both figures predate [framed].
+     [flat-violation-unreachable] reddens nothing in the suite. The gap in all
+     that is a later constructor whose [flattenable] does not propagate, which is
+     the case this branch is for. *)
   let rec drive st =
     match
       try
@@ -921,17 +1527,19 @@ module Make (W : Width.S) = struct
     with
     | None -> ()
     | Some () ->
-      (match unwind st.k with
-       | KGroup (s, d, k) ->
+      (* [unwind] stops at a [KGroup] entry. Only a group or a frame enters flat
+         mode, and each pushes a [KGroup] as it does, so a hardline that raises
+         in flat mode always has one below it and the search always finds it.
+         [unwind] lists the other kinds of entry, so that adding one forces a
+         decision there. *)
+      (match unwind None st.k with
+       | Some (s, d, k, before) ->
          restore st s;
+         Option.iter (fun fs -> st.flat_frames <- fs) before;
          st.flat <- false;
          st.k <- KDoc (d, KRestore (s.s_indent, s.s_flat, k));
          drive st
-       (* [unwind] stops at a [KGroup] frame. Only a group enters flat mode, so
-          a hardline that raises in flat mode always has
-       a group below it, and the search always finds a frame. The other frame kinds are
-          listed so that adding one forces a decision here. *)
-       | KNil | KDoc _ | KRestore _ | KPop _ -> ())
+       | None -> ())
   ;;
 
   let render ~width d =
@@ -945,6 +1553,7 @@ module Make (W : Width.S) = struct
       ; buf = Array.make 32 O_pop
       ; len = 0
       ; declined_rev = []
+      ; flat_frames = Tag_set.empty
       ; k = KDoc (d, KNil)
       }
     in

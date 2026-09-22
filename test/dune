@@ -9,6 +9,7 @@
   test_handsome
   test_laws
   test_render
+  test_framed
   test_width)
  (libraries handsome pprint alcotest qcheck-core qcheck-alcotest))
 

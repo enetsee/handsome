@@ -34,12 +34,13 @@ module Make (P : INSTANCE) = struct
   let ( ^^ ) = H.( ^^ )
   let at_all_widths p s = List.for_all ~f:(fun w -> p w s) Surface.widths
 
-  let test ?(count = 1000) name flavour prop =
+  let test_on ?(count = 1000) name gen prop =
     QCheck_alcotest.to_alcotest
       ~speed_level:`Quick
-      (Test.make ~count ~name ~print:Surface.show (Surface.gen flavour) prop)
+      (Test.make ~count ~name ~print:Surface.show gen prop)
   ;;
 
+  let test ?count name flavour prop = test_on ?count name (Surface.gen flavour) prop
   let render ~width s = H.render ~width (to_doc s)
   let bytes ~width s = H.to_string (fst (render ~width s))
 
@@ -67,9 +68,9 @@ module Make (P : INSTANCE) = struct
        Add before [let render ~width d =]:
            let leaked = ref 0
        and in the state initialiser replace
-           line = 0;
+           ; line = 0
        with
-           line = !leaked;
+           ; line = !leaked
        and after [drive st;] insert
            leaked := st.line;
      This is the "reuse the record and save the allocation" optimisation, done
@@ -79,9 +80,11 @@ module Make (P : INSTANCE) = struct
   (* -- annotation transparency --------------------------------------------- *)
 
   let annotation_transparency =
+    (* Over [wild] so that the rebuilt documents hold frames, whose tags the
+       rebuild has to keep. *)
     test
       "annotation transparency: unannotate (reannotate f d) = unannotate d"
-      Surface.rich
+      Surface.wild
       (fun s ->
          let d = to_doc s in
          let f x = x * 2 in
@@ -90,22 +93,31 @@ module Make (P : INSTANCE) = struct
 
   (* MUTATION annotation transparency:
        in [reannotate], replace
-           | Cat r -> reannotate fn r.l ^^ reannotate fn r.r
+           | Cat r -> down r.l (R_cat_todo (r.r, k))
        with
-           | Cat r -> reannotate fn r.r ^^ reannotate fn r.l
+           | Cat r -> down r.r (R_cat_todo (r.l, k))
+     -- the two children come back the other way round.
 
      A weaker mutation leaves it green: dropping the annotation node outright
-     ([| Annot (_, _, x) -> reannotate f x]) keeps the law true, since
+     ([| Annot r -> down r.d k]) keeps the law true, since
      [unannotate] removes the node on both sides. This law constrains
      [reannotate]'s treatment of the structure around annotations, and annotation
-     erasure below constrains the annotations themselves. *)
+     erasure below constrains the annotations themselves.
+
+   MUTATION annotation transparency, frames:
+       in [reannotate], replace
+           | R_frame (tag, k) -> up (frame tag v) k
+       with
+           | R_frame (_, k) -> up (frame (new_tag ()) v) k
+     -- the rebuilt frame binds a tag no conditional reads, so every conditional
+     inside is left outside it and takes its broken branch. *)
 
   (* -- annotation erasure -------------------------------------------------- *)
 
   let annotation_erasure =
     test
       "annotation erasure: annotations do not change the rendering"
-      Surface.rich
+      Surface.wild
       (at_all_widths (fun width s ->
          let d = to_doc s in
          let sa, ra = H.render ~width d in
@@ -135,20 +147,13 @@ module Make (P : INSTANCE) = struct
   ;;
 
   (* MUTATION group idempotence:
-       in [step], the [Group] case, replace
-           if st.flat then
-             (* Already committed to flat by an enclosing group: no decision here,
-                and no state to save. *)
-             step st r.d
-       with
-           if st.flat then begin
-             st.declined <- (st.line, st.column) :: st.declined;
-             step st r.d
-           end
-     -- treating "a group laid out flat" as a declined break. It is a plausible
+       in [step], the [Group] case, insert before
+           let fits = W.compare (W.add st.column r.req) st.ruler <= 0 in
+       the line
+           st.declined_rev <- (st.line, st.column) :: st.declined_rev;
+     -- treating a group's fit decision as a declined break. It is a plausible
      reading of what a resolution is, and it is wrong: the elective break is the
-     flat_alt, and the
-     group, and counting groups makes the record depend on how many times the
+     flat_alt, and counting groups makes the record depend on how many times the
      document was grouped. *)
 
   (* -- flat_alt, left and right -----------------------------------------------
@@ -251,7 +256,8 @@ module Make (P : INSTANCE) = struct
   let no_newline_in_text =
     test
       ~count:2000
-      "no newline in text: check rejects exactly the documents containing one"
+      "check completeness: check rejects exactly the documents with a newline in text or \
+       a conditional outside its frame"
       Surface.dirty
       (fun s ->
          let expected = Surface.offenders s in
@@ -260,7 +266,13 @@ module Make (P : INSTANCE) = struct
          | Error es, _ :: _ ->
            List.length es = List.length expected
            && List.for_all2
-                ~f:(fun (e : H.error) (text, index) -> e.text = text && e.index = index)
+                ~f:(fun (e : H.error) o ->
+                  match e, o with
+                  | Newline_in_text e, Surface.Newline (text, index) ->
+                    e.text = text && e.index = index
+                  | Alt_outside_frame n, Surface.Outside m -> n = m
+                  | Newline_in_text _, Surface.Outside _
+                  | Alt_outside_frame _, Surface.Newline _ -> false)
                 es
                 expected
          | Ok (), _ :: _ | Error _, [] -> false)
@@ -274,7 +286,14 @@ module Make (P : INSTANCE) = struct
      -- [check] accepts everything. The corpus [Surface.dirty] mixes text nodes
      carrying newlines with clean ones, so a mutation in either direction
      reddens: [Some 0] in place of [None], making [check] reject everything,
-     reddens it too. *)
+     reddens it too.
+
+   MUTATION check completeness, frames:
+       in [check], the [Falt] case, replace
+           go (Check r.f :: Check r.b :: rest)
+       with
+           go (Check r.f :: rest)
+     -- the broken branch of a frame's conditional goes unscanned. *)
 
   (* -- totality ------------------------------------------------------------ *)
 
@@ -313,17 +332,22 @@ module Make (P : INSTANCE) = struct
      with
          if st.flat then assert false
      stays green at any corpus size, and the corpus is adequate: flat mode is
-     entered where the cached width is finite, [Hard] is unflattenable, and [Alt]
-     is flattenable exactly when its flat branch is, so flat mode keeps clear of
+     entered where the cached width is finite, [Hard] is unflattenable, [Alt]
+     is flattenable exactly when its flat branch is, and a frame's conditional
+     exactly when the branch flat mode gives it is, so flat mode keeps clear of
      hardlines. The recovery in [drive] makes totality structural as well as
      argued.
 
      The recovery can be brought within reach and judged. The mutation
          | Hard -> false   ~>   | Hard -> true
      in [flattenable] measures every group containing a hardline as flattenable,
-     firing the recovery on most of the corpus, with the whole suite still
-     passing and the PPrint differential included. So it produces the correct
-     layout when it runs. Combining that with a flat-mode hardline that emits
+     firing the recovery on most of the corpus. The PPrint differential stays
+     green, and every document renders as the reference says apart from the one
+     case measured conservatively: a conditional in another's branch, free
+     there, with a hardline in one of its branches. The rule lays that out
+     broken; the edit lets it lay out flat and take the other branch, so the
+     recovery never runs there. Where it does run, it produces the correct
+     layout. Combining that with a flat-mode hardline that emits
      nothing reddens [doc/3]. The cached width protects that invariant. *)
 
   (* -- stream fidelity ----------------------------------------------------- *)
@@ -339,11 +363,11 @@ module Make (P : INSTANCE) = struct
   (* MUTATION stream fidelity:
        in [to_string], replace
            | S_line (n, k) ->
-               Buffer.add_char b '\n';
-               Buffer.add_string b (spaces n);
+             Buffer.add_char b '\n';
+             add_indent b n;
        with
            | S_line (_, k) ->
-               Buffer.add_char b '\n';
+             Buffer.add_char b '\n';
      -- the fold drops the indentation the stream recorded. *)
 
   (* -- width soundness --------------------------------------------------------
@@ -367,7 +391,7 @@ module Make (P : INSTANCE) = struct
 
   let declined_complete =
     test
-      "declined records exactly the flat_alts resolved flat"
+      "declined records exactly the flat_alts and frames' conditionals resolved flat"
       Surface.wild
       (at_all_widths (fun width s ->
          let _, r = render ~width s in
@@ -376,9 +400,14 @@ module Make (P : INSTANCE) = struct
 
   (* MUTATION declined completeness:
        in [step], the [Alt] case, replace
-           st.declined <- (st.line, st.column) :: st.declined;
+           st.declined_rev <- (st.line, st.column) :: st.declined_rev;
        with
-           st.declined <- (st.line + 1, st.column) :: st.declined; *)
+           st.declined_rev <- (st.line + 1, st.column) :: st.declined_rev;
+
+   MUTATION declined completeness, frames:
+       in [step], the [Falt] case, leave a conditional resolved flat out of
+       [declined]. Its broken branch can hold a break, so leaving it out loses
+       a break the engine declined. *)
 
   let declined_within_ruler =
     test
@@ -391,9 +420,9 @@ module Make (P : INSTANCE) = struct
 
   (* MUTATION width soundness:
        in [step], the [Group] case, replace
-           r.flattenable && W.compare (W.add st.column r.req) st.ruler <= 0
+           W.compare (W.add st.column r.req) st.ruler <= 0
        with
-           r.flattenable && W.compare st.column st.ruler <= 0
+           W.compare st.column st.ruler <= 0
      -- the fit test forgets to add the group's requirement, so a group is laid
      out flat whenever the current column is inside the ruler however wide the
      group is, and breaks get declined from columns past it. *)
@@ -502,9 +531,9 @@ module Make (P : INSTANCE) = struct
 
      For [flat_threshold] on its own,
        in [step], the [Group] case, replace
-           r.flattenable && W.compare (W.add st.column r.req) st.ruler <= 0
+           W.compare (W.add st.column r.req) st.ruler <= 0
        with
-           r.flattenable && W.compare (W.add st.column r.req) st.ruler < 0
+           W.compare (W.add st.column r.req) st.ruler < 0
      -- a group exactly as wide as the ruler is laid out broken, which is the
      threshold this law names. *)
 
@@ -562,6 +591,226 @@ module Make (P : INSTANCE) = struct
           [ 8; 30; 47; 48; 49; 60; Sys.int_size - 2 ] )
   ;;
 
+  (* -- frames -------------------------------------------------------------------
+
+     [framed] lays a document out as [group] does, and the conditional it hands
+     out follows that group. Most laws below probe a frame with a conditional of
+     their own, [alt (text "F") (text "B")]: no word in the corpus holds either
+     letter, so the output says which way the frame went.
+     ------------------------------------------------------------------------ *)
+
+  let tagging_is_layout_neutral =
+    (* A frame whose conditional nothing uses. The corpus has frames and
+       conditionals of its own, inside their frames and outside, and none of
+       them reach this one. *)
+    test
+      "framing is layout-neutral: framed (fun _ -> d) renders as group d"
+      Surface.wild
+      (at_all_widths (fun width s ->
+         let d = to_doc s in
+         H.render ~width (H.framed (fun _ -> d)) = H.render ~width (H.group d)))
+  ;;
+
+  (* MUTATION tagging is layout-neutral:
+       in [step], the [Frame] case, replace
+           let fits = W.compare (W.add st.column r.req) st.ruler <= 0 in
+       with
+           let fits = W.compare (W.add st.column r.req) st.ruler < 0 in
+     -- a frame exactly as wide as the ruler is laid out broken, where a group
+     is laid out flat.
+
+     Making [frame] drop its node when [d] holds a hardline, as [group] does,
+     leaves this green, and every other law: a frame laid out broken and no
+     frame at all both send a conditional to its broken branch. [framed/5]
+     reddens, through [check]. *)
+
+  let probe alt = alt (H.text "F") (H.text "B")
+
+  let probe_gen =
+    Gen.map3
+      (fun (a, b, c) p j -> a, b, c, p, j)
+      (Gen.triple
+         (Surface.gen Surface.wild)
+         (Surface.gen Surface.wild)
+         (Surface.gen Surface.wild))
+      (Gen.oneof_list (Surface.words @ Surface.unicode_words))
+      (Gen.int_range 0 6)
+  ;;
+
+  let show_probe_case (a, b, c, p, j) =
+    Printf.sprintf
+      "a=%s b=%s c=%s p=%S j=%d"
+      (Surface.show a)
+      (Surface.show b)
+      (Surface.show c)
+      p
+      j
+  ;;
+
+  let resolution =
+    (* The frame is [a ^^ group (b ^^ probe ^^ c)], after [p]. The probe sits in
+       a group of its own inside the frame, which is where a frame's conditional
+       and [flat_alt] part: the inner group can fit where the frame does not. Whether
+       the frame fits is decided by the reference, with the probe one column
+       wide. *)
+    QCheck_alcotest.to_alcotest
+      ~speed_level:`Quick
+      (Test.make
+         ~count:2000
+         ~name:"resolution: a frame's conditional follows the frame"
+         ~print:show_probe_case
+         probe_gen
+         (fun (a, b, c, p, j) ->
+            let frame =
+              Surface.Cat
+                (a, Surface.Group (Surface.Cat (b, Surface.Cat (Surface.Text "F", c))))
+            in
+            List.for_all
+              ~f:(fun width ->
+                let d =
+                  ctx
+                    j
+                    p
+                    (H.framed (fun alt ->
+                       to_doc a ^^ H.group (to_doc b ^^ probe alt ^^ to_doc c)))
+                in
+                let out = H.to_string (fst (H.render ~width d)) in
+                let flat = fits ~width p frame in
+                Bool.equal (String.contains out 'F') flat
+                && Bool.equal (String.contains out 'B') (not flat))
+              Surface.widths))
+  ;;
+
+  (* MUTATION resolution:
+       in [step], the [Falt] case, replace
+           if Tag_set.mem r.tag st.flat_frames
+       with
+           if st.flat
+     -- the conditional reads the group directly enclosing it, which is
+     [flat_alt]. *)
+
+  let flat_frame_fits =
+    (* Stated without the reference, so it holds the engine to the width contract
+       whatever the reference measures. A frame laid out flat puts [p] and all of
+       [s] on one line, and that line has to fit. *)
+    QCheck_alcotest.to_alcotest
+      ~speed_level:`Quick
+      (Test.make
+         ~count:2000
+         ~name:"width soundness, frames: a frame laid out flat fits within the ruler"
+         ~print:show_probe_case
+         probe_gen
+         (fun (s, _, _, p, j) ->
+            List.for_all
+              ~f:(fun width ->
+                let d = ctx j p (H.framed (fun alt -> to_doc s ^^ probe alt)) in
+                let stream, _ = H.render ~width d in
+                (not (String.contains (H.to_string stream) 'F'))
+                ||
+                let ls = H.lines stream in
+                Array.length ls = 1 && ls.(0) <= width)
+              Surface.widths))
+  ;;
+
+  (* MUTATION width soundness, frames:
+       in [frame], replace
+           let req = if flattenable then W.add fixed (broken_w_of rest) else W.zero in
+       with
+           let req = if flattenable then fixed else W.zero in
+     -- the frame leaves out the conditionals of frames further out, which print
+     their broken branch when it is laid out flat, so a trailing comma of an
+     outer list runs one column past the ruler. *)
+
+  let flat_group_fits =
+    (* The probe is a [flat_alt], so it says whether the group around it was
+       laid out flat. Free conditionals are measured at their broken branch,
+       which is what they print inside a group that decides. *)
+    QCheck_alcotest.to_alcotest
+      ~speed_level:`Quick
+      (Test.make
+         ~count:2000
+         ~name:"width soundness: a group laid out flat fits within the ruler"
+         ~print:show_probe_case
+         probe_gen
+         (fun (s, _, _, p, j) ->
+            List.for_all
+              ~f:(fun width ->
+                let d =
+                  ctx j p (H.group (to_doc s ^^ H.flat_alt (H.text "F") (H.text "B")))
+                in
+                let stream, _ = H.render ~width d in
+                (not (String.contains (H.to_string stream) 'F'))
+                ||
+                let ls = H.lines stream in
+                Array.length ls = 1 && ls.(0) <= width)
+              Surface.widths))
+  ;;
+
+  (* MUTATION width soundness, groups:
+       in [frame_alt], give the [Falt] node its flat branch's measure in place
+       of its broken branch's
+     -- a group between a conditional and its frame measures the branch it
+     never prints while deciding. *)
+
+  let exact_measure =
+    (* A frame, or a group, is laid out flat exactly when what it prints flat
+       fits. Stated against the flat rendering, so it holds the measure to the
+       bytes. Documents with a conditional nested in another's branch and free
+       there are left out, since the interface measures that case at its wider
+       branch. *)
+    QCheck_alcotest.to_alcotest
+      ~speed_level:`Quick
+      (Test.make
+         ~count:2000
+         ~name:
+           "exact measure: a frame or group is flat exactly when its flat rendering fits"
+         ~print:show_probe_case
+         probe_gen
+         (fun (s, _, _, p, j) ->
+            Surface.nested_free s
+            || List.for_all
+                 ~f:(fun width ->
+                   let fits =
+                     match Reference.flat s with
+                     | None -> false
+                     | Some flat -> P.measure p + P.measure flat + P.measure "F" <= width
+                   in
+                   let flat_in d =
+                     String.contains (H.to_string (fst (H.render ~width (ctx j p d)))) 'F'
+                   in
+                   Bool.equal (flat_in (H.framed (fun alt -> to_doc s ^^ probe alt))) fits
+                   && Bool.equal
+                        (flat_in
+                           (H.group (to_doc s ^^ H.flat_alt (H.text "F") (H.text "B"))))
+                        fits)
+                 Surface.widths))
+  ;;
+
+  (* MUTATION exact measure:
+       in [frame], measure the frame's own conditionals at their broken branch
+     -- the frame counts a trailing comma it leaves out when flat, and breaks a
+     column early for each one. *)
+
+  let deep_frames =
+    (* Many frames free in one region at once, which the tree keeping them has
+       to add, remove and rebalance. The reference computes every frame's
+       measure by walking its body. *)
+    test_on
+      ~count:500
+      "deep frames: many frames free in one region lay out as the reference says"
+      Surface.gen_deep
+      (at_all_widths (fun width s ->
+         let stream, r = render ~width s in
+         let want = ref_render ~width s in
+         String.equal (H.to_string stream) want.Reference.bytes
+         && r.H.declined = want.Reference.declined))
+  ;;
+
+  (* MUTATION deep frames:
+       in [f_node], leave the right subtree out of [all_broken_w]
+     -- a frame reading the sum of the other frames' conditionals misses some,
+     once there are enough of them for the tree to have a right subtree. *)
+
   let suite =
     ( "laws-" ^ P.name
     , [ determinism
@@ -581,6 +830,12 @@ module Make (P : INSTANCE) = struct
       ; flat_threshold
       ; monotonicity_counterexample
       ; extreme_nesting
+      ; tagging_is_layout_neutral
+      ; resolution
+      ; flat_frame_fits
+      ; flat_group_fits
+      ; exact_measure
+      ; deep_frames
       ] )
   ;;
 end
@@ -633,9 +888,9 @@ let differential =
 
 (* MUTATION differential:
      in [step], the [Group] case, replace
-         r.flattenable && W.compare (W.add st.column r.req) st.ruler <= 0
+         W.compare (W.add st.column r.req) st.ruler <= 0
      with
-         r.flattenable && W.compare (W.add st.column r.req) st.ruler < 0
+         W.compare (W.add st.column r.req) st.ruler < 0
    -- an off-by-one ruler. It reddens stream fidelity as well, the reference
    renderer implementing the same specification. The differential carries weight
    because PPrint was written independently. *)

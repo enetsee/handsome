@@ -3,6 +3,10 @@
     - {!module-type-S.flat_alt} is the primitive conditional.
       {!module-type-S.line}, {!module-type-S.softline} and
       {!module-type-S.blank} are defined in terms of it.
+    - {!module-type-S.framed} makes a group and hands its body a conditional
+      that follows it from any depth. A trailing separator is the case it is
+      for: the whole list decides whether it appears, and the last element's
+      line prints it.
     - {!module-type-S.annotate} applies to a region, and annotations appear in
       the rendered {!module-type-S.stream}. Plain text, HTML and terminal colour
       are folds over that stream.
@@ -48,7 +52,9 @@ module Width : sig
       - [measure (a ^ b) = add (measure a) (measure b)]. A document's width is
         the sum of its text nodes', computed at construction and held from then
         on, so an additive measure keeps the cached width correct;
-      - [add] is associative, and monotone in both arguments under [compare];
+      - [add] is associative and commutative, and monotone in both arguments
+        under [compare]. A group made with [framed] adds up the widths of the
+        conditionals inside it by frame, out of document order;
       - [compare] is a total order. *)
     val measure : string -> t
   end
@@ -109,9 +115,13 @@ module type S = sig
 
   (** A defect found by {!check}. *)
   type error =
-    { text : string (** the offending text node *)
-    ; index : int (** byte offset of its first newline *)
-    }
+    | Newline_in_text of
+        { text : string (** the offending text node *)
+        ; index : int (** byte offset of its first newline *)
+        }
+    | Alt_outside_frame of int
+    (** A conditional from {!framed} used outside the body it was handed to.
+        The number is the one {!pp} prints for its frame. *)
 
   (** {2 Atoms and concatenation} *)
 
@@ -194,6 +204,70 @@ module type S = sig
       is the display column. *)
   val align : 'a t -> 'a t
 
+  (** {2 Conditionals on an outer group}
+
+      {!flat_alt} resolves against the group directly enclosing it. Some choices
+      belong to a group further out. Whether a list prints a trailing separator
+      depends on whether the whole list broke, and the separator is printed on
+      the last element's line, which may be a group of its own.
+
+      {!framed} makes a group and hands its body a conditional that follows
+      it, so the separator stays where it is printed and follows the list's
+      decision:
+
+      {[
+        framed (fun alt ->
+          text "["
+          ^^ nest 2 (softline ^^ elements ^^ alt empty (text ","))
+          ^^ softline
+          ^^ text "]")
+      ]} *)
+
+  (** [framed body] is [body alt] laid out as {!group} lays it out, where
+      [alt a b] is [a] if this group was laid out flat and [b] if it broke.
+      [alt] can be passed to the code that builds part of the body, and used at
+      any depth inside it, including inside other groups and other [framed]
+      groups.
+
+      Used outside the body it was handed to, [alt a b] is [b], and {!check}
+      reports it. A body that cannot lie flat, because a flat layout would reach
+      a hardline, is laid out broken, as under {!group}, so every [alt] in it
+      takes its broken branch. {!reannotate} and {!unannotate} keep each
+      conditional following its frame.
+
+      The body is built inside the callback, so frames nested [n] deep are built
+      by [n] nested calls.
+
+      Measurement is exact but for one case, below. A group decides whether it
+      fits only while every group around it is broken, so a group between the
+      conditional and its frame measures [alt a b] at [b], and the frame and
+      every group around it measure it at [a]. Each measures what it would
+      print:
+
+      {[
+        framed (fun alt -> text "abc" ^^ alt empty (text ","))
+        (* measures 3, and prints "abc" when flat *)
+      ]}
+
+      A hardline follows the same rule. One in [b] leaves broken the groups
+      between the conditional and its frame, since those decide only once the
+      frame has broken, and one in [a] leaves the frame and every group around
+      it broken. So [alt empty hardline] is a newline where the frame broke and
+      nothing where it was flat.
+
+      The one case measured conservatively is a conditional inside a branch of
+      another frame's conditional, whose own frame lies outside that branch. It
+      counts at the wider of its two branches, and a hardline in either counts.
+      Whether it is printed then turns on two frames at once. Measuring that
+      exactly within the costs below would take a much heavier structure than
+      the rest of the design needs, for a case that seldom arises.
+
+      Building a document of [n] nodes, counted as a tree, costs
+      [O(n log^2 n)] at most, and a frame [O(log k)] for [k] frames whose
+      conditionals pass through it. Rendering and {!check} look each frame and
+      conditional up in the set of frames around it, at [O(log k)] each. *)
+  val framed : (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
+
   (** {2 Annotations}
 
       An annotation applies to a region, and is transparent to measurement:
@@ -209,18 +283,29 @@ module type S = sig
 
   (** {2 Checking and printing} *)
 
-  (** [check d] is [Ok ()] when every text node in [d] is free of newlines, and
-      [Error es] otherwise, with one entry per offending node in document order.
+  (** [check d] is [Ok ()] when every text node in [d] is free of newlines and
+      every conditional from {!framed} lies inside its frame, and [Error es]
+      otherwise, with one entry per offending node in document order.
 
       A newline the engine emits carries the current indentation and leaves the
       column at it. One inside a text node leaves the column wrong for
       everything after it, and the enclosing group measures the document as
-      though it could be laid out flat. *)
+      though it could be laid out flat.
+
+      A conditional outside its frame takes its broken branch, which is well
+      defined and seldom what was meant. Check the finished document: a part
+      built inside a frame's body and checked on its own reports its
+      conditionals outside. *)
   val check : 'a t -> (unit, error list) result
 
   (** Prints the structure of a document as an s-expression. Annotation payloads
       are outside what a generic printer can render, so [annotate a d] prints as
-      [(annotate d)]. *)
+      [(annotate d)].
+
+      [framed] prints as [(frame n d)] and each of its conditionals as
+      [(frame-alt n a b)], where [n] numbers the frames from 0 in the order the
+      printout first meets them. The same document prints the same way however
+      many frames the process made before it. *)
   val pp : Format.formatter -> 'a t -> unit
 
   val pp_error : Format.formatter -> error -> unit
@@ -241,9 +326,9 @@ module type S = sig
             carries [0]. A space at the end of a line comes from a text node;
             see {!blank}. *)
 
-  (** [declined] holds one [(line, column)] entry per {!flat_alt} the renderer
-      resolved flat, in document order, recorded at the position the alternative
-      stood at.
+  (** [declined] holds one [(line, column)] entry per {!flat_alt}, and per
+      conditional from {!framed}, that the renderer resolved flat, in document
+      order, recorded at the position the alternative stood at.
 
       A [flat_alt] resolved flat leaves no mark in the output, so this record is
       the only account of it. It distinguishes a line over the ruler that the

@@ -92,13 +92,14 @@ struct
       (fun s -> W.compare (W.measure s) W.zero >= 0)
   ;;
 
-  (* [compare] a total order, [add] associative and monotone in both arguments.
-     The engine needs all three: it compares a sum against the ruler, and it
-     sums a document's text nodes in whatever order the concatenation tree
-     happens to associate. *)
+  (* [compare] a total order, [add] associative, commutative and monotone in
+     both arguments. The engine needs all four: it compares a sum against the
+     ruler, it sums a document's text nodes in whatever order the concatenation
+     tree happens to associate, and a frame sums its conditionals by frame, out
+     of document order. *)
   let algebra =
     t
-      "compare is a total order; add is associative and monotone"
+      "compare is a total order; add is associative, commutative and monotone"
       (fun (a, b, c) -> Printf.sprintf "%d %d %d" a b c)
       (Gen.triple
          (Gen.map W.measure P.gen)
@@ -110,6 +111,7 @@ struct
          && sign (W.compare a b) = -sign (W.compare b a)
          && ((not (W.compare a b <= 0 && W.compare b c <= 0)) || W.compare a c <= 0)
          && W.add (W.add a b) c = W.add a (W.add b c)
+         && W.add a b = W.add b a
          && ((not (W.compare a b <= 0))
              || (W.compare (W.add a c) (W.add b c) <= 0
                  && W.compare (W.add c a) (W.add c b) <= 0)))

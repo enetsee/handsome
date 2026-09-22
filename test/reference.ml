@@ -8,7 +8,12 @@
    emitting straight to a buffer.
 
    [measure] is a parameter for the reason it is one in the library: the laws
-   run under Utf8 as well as Ascii, and both need a reference. *)
+   run under Utf8 as well as Ascii, and both need a reference.
+
+   Tags are indices here, the way [Surface] writes them: a list of the enclosing
+   [Framed]s' resolutions, innermost first, stands in for the engine's table.
+   An index past the end of it is a conditional with no frame, and takes its
+   broken branch. *)
 
 open StdLabels
 open Surface
@@ -19,49 +24,82 @@ let add a b =
   | _ -> None
 ;;
 
-(* The width of a document laid out flat; [None] where it holds a hardline. *)
-let rec flat_width ~measure : Surface.t -> int option = function
+(* The width a group measures [d] at when deciding whether it fits; [None]
+   where it holds a hardline that counts.
+
+   [depth] is how many [Framed]s lie between [d]'s root and the node in hand, so
+   a [Frame_alt] whose index falls below it has its frame inside [d]. A group
+   only decides while every frame around it is broken, so such a conditional
+   counts at its flat branch, and any other at its broken branch. Inside a
+   branch of a [Frame_alt], one that is free in that branch counts at the
+   wider of its two, which is what [wider] says. Branches are measured from
+   their own root, so that "free in that branch" is decided relative to it. *)
+let rec measure_at ~measure ~wider depth : Surface.t -> int option = function
   | Text s -> Some (measure s)
   | Empty -> Some 0
-  | Cat (a, b) -> add (flat_width ~measure a) (flat_width ~measure b)
+  | Cat (a, b) ->
+    add (measure_at ~measure ~wider depth a) (measure_at ~measure ~wider depth b)
   | Concat ds ->
-    List.fold_left ~f:(fun acc d -> add acc (flat_width ~measure d)) ~init:(Some 0) ds
-  | Flat_alt (a, _) -> flat_width ~measure a
+    List.fold_left
+      ~f:(fun acc d -> add acc (measure_at ~measure ~wider depth d))
+      ~init:(Some 0)
+      ds
+  | Flat_alt (a, _) -> measure_at ~measure ~wider depth a
   | Line -> Some (measure " ")
   | Softline -> Some 0
   | Hardline -> None
   | Blank -> Some (measure " ")
-  | Group d | Nest (_, d) | Align d | Annot (_, d) -> flat_width ~measure d
+  | Group d | Nest (_, d) | Align d | Annot (_, d) -> measure_at ~measure ~wider depth d
+  | Framed d -> measure_at ~measure ~wider (depth + 1) d
+  | Frame_alt (i, a, b) ->
+    let branch x = measure_at ~measure ~wider:true 0 x in
+    if i < depth
+    then branch a
+    else if wider
+    then (
+      match branch a, branch b with
+      | Some x, Some y -> Some (max x y)
+      | _ -> None)
+    else branch b
 ;;
+
+let flat_width ~measure d = measure_at ~measure ~wider:false 0 d
 
 type rendered =
   { bytes : string
-  ; declined : (int * int) list (** the flat_alts resolved flat, in order *)
+  ; declined : (int * int) list
+    (** the flat_alts and frames' conditionals resolved flat, in order *)
   }
 
 (* The flat rendering: every elective break resolved flat, so the result is a
-   single line. [None] where the document holds a hardline. Written directly, so
-   that a property relating this to [render] at a wide ruler compares two
-   implementations. *)
+   single line. [None] where no group around the document could lay it out flat,
+   which is where [flat_width] says so. Written directly, so that a property
+   relating this to [render] at a wide ruler compares two implementations.
+
+   Every frame is flat here, so a conditional takes its flat branch where its
+   frame is in the document and its broken branch where it has none. *)
 let flat d =
   let b = Buffer.create 64 in
-  let exception Unflattenable in
-  let rec go = function
+  let rec go depth = function
     | Text s -> Buffer.add_string b s
     | Empty -> ()
     | Cat (a, c) ->
-      go a;
-      go c
-    | Concat ds -> List.iter ~f:go ds
-    | Flat_alt (a, _) -> go a
+      go depth a;
+      go depth c
+    | Concat ds -> List.iter ~f:(go depth) ds
+    | Flat_alt (a, _) -> go depth a
     | Line | Blank -> Buffer.add_char b ' '
     | Softline -> ()
-    | Hardline -> raise Unflattenable
-    | Group d | Nest (_, d) | Align d | Annot (_, d) -> go d
+    | Hardline -> assert false (* ruled out by [flat_width] *)
+    | Group d | Nest (_, d) | Align d | Annot (_, d) -> go depth d
+    | Framed d -> go (depth + 1) d
+    | Frame_alt (i, a, c) -> go depth (if i < depth then a else c)
   in
-  match go d with
-  | () -> Some (Buffer.contents b)
-  | exception Unflattenable -> None
+  match flat_width ~measure:String.length d with
+  | None -> None
+  | Some _ ->
+    go 0 d;
+    Some (Buffer.contents b)
 ;;
 
 let render ~measure ~width d =
@@ -90,35 +128,50 @@ let render ~measure ~width d =
     column := i;
     incr line
   in
-  let rec go indent flat d =
+  let fits x =
+    match flat_width ~measure x with
+    | Some w -> !column + w <= width
+    | None -> false
+  in
+  let rec go indent flat frames d =
     match d with
     | Text s -> emit s
     | Empty -> ()
     | Cat (a, c) ->
-      go indent flat a;
-      go indent flat c
-    | Concat ds -> List.iter ~f:(go indent flat) ds
+      go indent flat frames a;
+      go indent flat frames c
+    | Concat ds -> List.iter ~f:(go indent flat frames) ds
     | Flat_alt (a, c) ->
       if flat
       then (
         declined := (!line, !column) :: !declined;
-        go indent flat a)
-      else go indent flat c
-    | Line -> go indent flat (Flat_alt (Text " ", Hardline))
-    | Softline -> go indent flat (Flat_alt (Empty, Hardline))
-    | Blank -> go indent flat (Flat_alt (Text " ", Empty))
+        go indent flat frames a)
+      else go indent flat frames c
+    | Line -> go indent flat frames (Flat_alt (Text " ", Hardline))
+    | Softline -> go indent flat frames (Flat_alt (Empty, Hardline))
+    | Blank -> go indent flat frames (Flat_alt (Text " ", Empty))
     | Hardline -> brk indent
-    | Group x ->
-      let fits =
-        match flat_width ~measure x with
-        | Some w -> !column + w <= width
+    | Group x -> go indent (flat || fits x) frames x
+    | Nest (j, x) -> go (indent + j) flat frames x
+    | Align x -> go !column flat frames x
+    | Annot (_, x) -> go indent flat frames x
+    | Framed x ->
+      let resolved = flat || fits d in
+      go indent resolved (resolved :: frames) x
+    (* Recorded in [declined] where it takes its flat branch, as a [Flat_alt]
+       is. *)
+    | Frame_alt (i, a, c) ->
+      let take_flat =
+        match List.nth_opt frames i with
+        | Some resolved -> resolved
         | None -> false
       in
-      go indent (flat || fits) x
-    | Nest (j, x) -> go (indent + j) flat x
-    | Align x -> go !column flat x
-    | Annot (_, x) -> go indent flat x
+      if take_flat
+      then (
+        declined := (!line, !column) :: !declined;
+        go indent flat frames a)
+      else go indent flat frames c
   in
-  go 0 false d;
+  go 0 false [] d;
   { bytes = Buffer.contents b; declined = List.rev !declined }
 ;;

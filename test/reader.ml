@@ -6,7 +6,13 @@
 
    Annotation payloads are outside what a generic printer can render, so [pp]
    emits [(annotate d)] and this rebuilds [annotate () d]. The round-trip is
-   therefore exact on [unit t], and exact up to annotation payloads elsewhere. *)
+   therefore exact on [unit t], and exact up to annotation payloads elsewhere.
+
+   [pp] numbers frames locally to the printout. The reader makes a fresh frame
+   for each, so a document with frames in it reads back equal up to a renaming
+   of its tags, and prints the same. A [frame-alt] whose number no enclosing
+   [frame] carries was outside its frame, and reads back as a conditional whose
+   frame has closed. *)
 
 open StdLabels
 module H = Handsome.Ascii
@@ -70,8 +76,39 @@ let tokenise (s : string) : token list =
   List.rev !out
 ;;
 
+let pop_number toks =
+  match !toks with
+  | Atom a :: rest ->
+    toks := rest;
+    (match int_of_string_opt a with
+     | Some n -> n
+     | None -> raise (Parse_error "a frame is numbered"))
+  | _ -> raise (Parse_error "expected a frame number")
+;;
+
+let stray () =
+  let got = ref None in
+  ignore
+    (H.framed (fun alt ->
+       got := Some alt;
+       H.empty)
+     : unit H.t);
+  match !got with
+  | Some alt -> alt
+  | None -> assert false
+;;
+
 let read (s : string) : unit H.t =
   let toks = ref (tokenise s) in
+  let alts = Hashtbl.create 8 in
+  let alt n =
+    match Hashtbl.find_opt alts n with
+    | Some alt -> alt
+    | None ->
+      let alt = stray () in
+      Hashtbl.add alts n alt;
+      alt
+  in
   let pop () =
     match !toks with
     | [] -> raise (Parse_error "unexpected end of input")
@@ -132,6 +169,21 @@ let read (s : string) : unit H.t =
          let d = doc () in
          expect_rpar ();
          H.annotate () d
+       | Atom "frame" ->
+         let n = pop_number toks in
+         let d =
+           H.framed (fun alt ->
+             Hashtbl.replace alts n alt;
+             doc ())
+         in
+         expect_rpar ();
+         d
+       | Atom "frame-alt" ->
+         let alt = alt (pop_number toks) in
+         let a = doc () in
+         let b = doc () in
+         expect_rpar ();
+         alt a b
        | Lpar | Rpar | Atom _ | Str _ -> raise (Parse_error "expected a head symbol"))
   in
   let d = doc () in
