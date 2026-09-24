@@ -107,8 +107,39 @@ val unicode_version : string
 
 (** {1 Documents} *)
 
+(** How a group decides whether to lay out flat. Under either rule it compares
+    a width against the ruler, from the column the group starts at.
+
+    - [Content] measures the group's own content laid out flat. It is the rule
+      of Wadler's printer and of PPrint, and the default. What follows the group
+      on the same line takes no part in the decision, so a group can fit where
+      the line it ends up on does not.
+    - [Line] adds what follows the group up to the next break, as Lindig's
+      strict printer does. That is measured as it will print: a conditional at
+      its broken branch, since a group only decides while the groups around it
+      are broken, and a group further along at its flat width, which it then
+      takes.
+
+    {[
+      group (text "ab" ^^ line ^^ text "cd") ^^ text "efgh"
+      (* at width 6, under Content:  "ab cdefgh"  *)
+      (* at width 6, under Line:     "ab\ncdefgh" *)
+    ]}
+
+    Under [Line], every line holding a break the engine resolved flat stays
+    within the ruler; see {!module-type-S.resolutions}. Rendering is linear in
+    the document under both. *)
+type fit =
+  | Content
+  | Line
+
 module type S = sig
   type width
+
+  (** The rule a group decides by; see {!Handsome.fit}. *)
+  type nonrec fit = fit =
+    | Content
+    | Line
 
   (** A document whose annotations have type ['a]. *)
   type 'a t
@@ -340,22 +371,29 @@ module type S = sig
         for every (line, col) in r.declined:  (lines s).(line) <= width
       ]}
 
-      That check holds where the caller accounts for everything it places on a
-      line. The engine's guarantee covers the flat region it committed to;
-      content appended to the same line afterwards falls outside it.
+      Under {!Line} that check holds for every document without a newline in a
+      text node, because each group measures its line up to the next break.
+
+      Under {!Content} it holds where the caller accounts for everything it
+      places on a line. The engine's guarantee covers the flat region it
+      committed to; content appended to the same line afterwards falls outside
+      it.
 
       {[
         group (text "ab" ^^ line ^^ text "cd") ^^ text "eeeeeeeeee"
-        (* at width 10:  "ab cdeeeeeeeeee", declined [(0, 2)] *)
+        (* at width 10, under Content:  "ab cdeeeeeeeeee",   declined [(0, 2)] *)
+        (* at width 10, under Line:     "ab\ncdeeeeeeeeee", declined []       *)
       ]}
 
-      A failure means the caller placed bytes on a line that some fit decision
-      omitted. The engine's own guarantee is the local one: every declined break
-      sits at a column within the ruler. *)
+      A failure under [Content] means the caller placed bytes on a line that
+      some fit decision omitted. The engine's guarantee under either rule
+      includes the local one: every declined break sits at a column within the
+      ruler. *)
   type resolutions = { declined : (int * width) list }
 
-  (** Returns for every document, including one {!check} rejects. *)
-  val render : width:width -> 'a t -> 'a stream * resolutions
+  (** Returns for every document, including one {!check} rejects. [fit] is the
+      rule each group decides by, {!Content} unless given. *)
+  val render : ?fit:fit -> width:width -> 'a t -> 'a stream * resolutions
 
   (** The rendered bytes. Requires each line's indentation to fit within
       [Sys.max_string_length], and raises where it exceeds that; {!render} and

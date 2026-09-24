@@ -87,8 +87,17 @@ module Utf8_width = struct
   ;;
 end
 
+type fit =
+  | Content
+  | Line
+
 module type S = sig
   type width
+
+  type nonrec fit = fit =
+    | Content
+    | Line
+
   type 'a t
 
   type error =
@@ -127,13 +136,17 @@ module type S = sig
 
   type resolutions = { declined : (int * width) list }
 
-  val render : width:width -> 'a t -> 'a stream * resolutions
+  val render : ?fit:fit -> width:width -> 'a t -> 'a stream * resolutions
   val to_string : 'a stream -> string
   val lines : 'a stream -> width array
 end
 
 module Make (W : Width.S) = struct
   type width = W.t
+
+  type nonrec fit = fit =
+    | Content
+    | Line
 
   (* -- documents --------------------------------------------------------------
 
@@ -1386,8 +1399,10 @@ module Make (W : Width.S) = struct
       mutable flat_frames : Tag_set.t
     ; mutable k : 'a kont
     ; (* The width the pending work in [k] puts on the current line, up to its
-         first break. Kept on every push and pop, and read by no decision yet. *)
+         first break. Kept on every push and pop under either rule, and read by
+         the fit test under [Line]. *)
       mutable tail : W.t
+    ; fit : fit
     }
 
   (* Raised by a hardline reached in flat mode, and caught in [drive], which
@@ -1451,6 +1466,14 @@ module Make (W : Width.S) = struct
      | None -> ());
     st.declined_rev <- s.s_declined;
     st.tail <- s.s_tail
+  ;;
+
+  (* The column a group or frame measuring [req] would reach, under the rule in
+     force. *)
+  let[@inline] reach st req =
+    match st.fit with
+    | Content -> W.add st.column req
+    | Line -> W.add (W.add st.column req) st.tail
   ;;
 
   let rec run st =
@@ -1527,7 +1550,7 @@ module Make (W : Width.S) = struct
            exists carries that bit set, and ['a t] is abstract, so none can be built
            elsewhere. Worth spelling out here because the field is in scope:
            reading it would imply it could be false. *)
-        let fits = W.compare (W.add st.column r.req) st.ruler <= 0 in
+        let fits = W.compare (reach st r.req) st.ruler <= 0 in
         if not fits
         then step st r.d
         else (
@@ -1546,7 +1569,7 @@ module Make (W : Width.S) = struct
       then (* A hardline inside it, so it is laid out broken. *)
         step st r.d
       else (
-        let fits = W.compare (W.add st.column r.req) st.ruler <= 0 in
+        let fits = W.compare (reach st r.req) st.ruler <= 0 in
         if not fits
         then step st r.d
         else (
@@ -1661,7 +1684,7 @@ module Make (W : Width.S) = struct
        | None -> ())
   ;;
 
-  let render ~width d =
+  let render ?(fit = Content) ~width d =
     let st =
       { ruler = width
       ; indent = 0
@@ -1675,6 +1698,7 @@ module Make (W : Width.S) = struct
       ; flat_frames = Tag_set.empty
       ; k = KDoc (d, W.zero, KNil)
       ; tail = W.zero
+      ; fit
       }
     in
     drive st;

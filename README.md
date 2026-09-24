@@ -29,16 +29,25 @@ a `softline` disappears altogether. The output keeps no sign that a break was
 available there. `render` hands back the line and column of each one, so you can
 see where the printer had a choice and which way it went.
 
-Two things follow. You can tell a long line caused by a bad choice from one
-caused by a run of text with nowhere to break in it. And since the answer is a
-return value, you can write a test over it: every byte on a line was counted by
-the decision that put it there.
+This has two consequences. 
 
-Two smaller decisions come from the same place: the layout model has to match
-what gets printed. `check` reports a newline inside a text node as an error,
-because a newline the engine did not emit leaves the column wrong for everything
-after it. And width is a
-functor parameter with an explicit obligation: `measure` must never
+1) You can tell a long line caused by a bad choice from one
+caused by a run of text with nowhere to break in it. And,
+2) since the answer is a return value, you can write a test over it: every byte on a line was counted by the decision that put it there.
+
+**A group can measure the rest of its line.** By default a group decides by its
+own content, as Wadler's printer and PPrint do, so
+`group (text "ab" ^^ line ^^ text "cd") ^^ text "efgh"` prints `ab cdefgh` at
+width 6: nine columns on a ruler of six. `render ~fit:Line` has each group
+measure what follows it up to the next break as well, as Lindig's strict printer
+does, and prints `ab` and `cdefgh` on two lines. Under that rule the test above
+holds for every document `check` accepts: each line holding a declined break is
+within the ruler.
+
+Two smaller decisions come from the same place: 
+1) the layout model has to match
+what gets printed. `check` reports a newline inside a text node as an error, because a newline the engine did not emit leaves the column wrong for everything after it. And,
+2) width is a functor parameter with an explicit obligation: `measure` must never
 *under*-report display width. Two instances ship:
 
 ```ocaml
@@ -61,15 +70,12 @@ of default builds, because it reads the UCD over the network.
 
 ```ocaml
 val flat_alt : 'a t -> 'a t -> 'a t   (* the primitive; line and softline derive from it *)
-val render   : width:width -> 'a t -> 'a stream * resolutions
+val render   : ?fit:fit -> width:width -> 'a t -> 'a stream * resolutions
 val check    : 'a t -> (unit, error list) result
 ```
 
-The design is borrowed. The annotation scheme is Haskell
-[`prettyprinter`](https://hackage.haskell.org/package/prettyprinter)'s, whose
-lineage runs Wadler → Leijen → Bolingbroke → Luposchainsky. What handsome adds
-is the break-resolution record, treating a newline in a text node as an error,
-and being in OCaml.
+The design is fairly unoriginal. The annotation scheme is Haskell
+[`prettyprinter`](https://hackage.haskell.org/package/prettyprinter)'s, whose lineage runs Wadler → Leijen → Bolingbroke → Luposchainsky. What handsome adds is the break-resolution record, treating a newline in a text node as an error.
 
 [API documentation](https://enetsee.github.io/handsome/handsome/Handsome/index.html)
 
@@ -111,67 +117,5 @@ flambda. It costs one word per node: an abstract `W.t` has no spare value to
 stand for infinity, so a node needs a separate flag to say it has no flat
 layout.
 
-## What the tests establish
-
-- **A differential against [PPrint](https://github.com/fpottier/pprint).** Every
-  construct in the library has an exact PPrint counterpart, so the generated
-  documents cover all of it. `to_string (render d)` agrees with PPrint byte for
-  byte over 9000 documents at ten widths each, and 3000 more at every width from
-  0 to 60, with zero disagreements. The two libraries differ in one place:
-  PPrint has *suppressible blanks*, which belong to its renderer, where
-  handsome's blanks belong to the document. Against idiomatic PPrint (`break`)
-  the two agree exactly, up to trailing whitespace.
-- **A negative result.** Widening the ruler does not monotonically shorten the
-  output: flattening an early group spends horizontal room that a later group
-  needed. The counterexample is exhaustively minimal at nine nodes, and a test
-  pins it. Two endpoints do hold: no width renders in fewer lines than an
-  unbounded one, and none in more than zero.
-- **The laws**, one property test each, in `test/test_laws.ml`, run under both
-  width instances. That matters most for width soundness, which is the law that
-  fails when a measure under-reports. Running it only under the measure that
-  always over-reports would put it where it has nothing to catch.
-- **The width signature's obligations** as properties over a functor, in
-  `test/test_width.ml`, with four instances: the two the library ships, and two
-  synthetic ones where a space measures something other than one column. One
-  measures every byte at two columns; the other measures a space at zero. Under
-  the shipped instances a space is one column, which makes `spaces_for` the
-  identity function, so a wrong answer from it would still look right. The
-  synthetic pair forces a real answer. The same file checks what separates the
-  two shipped instances (`Ascii.measure s >= Utf8.measure s` on every valid
-  UTF-8 string) and what both leave alone (the measure moves whitespace and
-  every other byte stays put).
-- **Mutation coverage.** Each of a set of named mutations goes into a clean copy
-  of the library on its own, and the tests that go red are recorded. Almost
-  every test is reddened by at least one. The handful that survive everything
-  are listed with the reason: the `render` and `check` depth cases, because no
-  small edit makes the engine recurse on the document, and the obligations on
-  the two synthetic width instances, which live in the test file where a
-  mutation of the library cannot reach them. Two mutations redden nothing at
-  all, and those are recorded as findings.
-
-### Two decisions worth spelling out
-
-`blank` is `flat_alt (text " ") empty`. It fills the fourth corner of the table
-the derived breaks form:
-
-|                   | broken = `hardline` | broken = `empty` |
-|-------------------|---------------------|------------------|
-| flat = `text " "` | `line`              | `blank`          |
-| flat = `empty`    | `softline`          | `empty`          |
-
-It clears itself when the group breaks: in `group (a ^^ blank ^^ softline ^^ b)`
-the space is there on one line and gone on two. That covers the case where the
-break follows the separator inside the same group.
-
-A flat group ending in a space, with the break arriving from outside it, leaves
-the space at the end of the line. `group (text "a" ^^ line) ^^ hardline` gives
-`"a \n"`. PPrint suppresses that. Its blanks belong to the renderer, where
-handsome's belong to the document, and moving the break inside the group puts
-both under one decision. That accounts for the "up to trailing whitespace"
-qualification above.
-
-Indentation is emitted once something lands on the line. `S_line` carries `0`
-for a line that stays empty, so a line always ends in something the engine
-printed. Emitting indentation eagerly would break the width soundness law, since
-a blank line indented past the ruler exceeds the width while holding nothing
-that could be broken. PPrint does the same.
+The `Line` rule costs one more word per node, under either rule: the width each
+node puts on its first line when laid out broken. Documents are about an eighth larger for it, and rendering is up to a tenth slower.

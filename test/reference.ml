@@ -67,7 +67,7 @@ let flat_width ~measure d = measure_at ~measure ~wider:false 0 d
 
 (* What [d] puts on the line it starts on when laid out broken, and whether a
    break ends that line inside it: the share of the line a pending document
-   takes, which is what the [`Line] rule adds to a group's own width.
+   takes, which is what the [Line] rule adds to a group's own width.
 
    Everything pending when a group decides is laid out broken, because a group
    only decides while every group and frame around it is broken. So a
@@ -136,10 +136,12 @@ let flat d =
     Some (Buffer.contents b)
 ;;
 
-(* [fit] chooses what a group measures when it decides: [`Content] is its own
-   flat width, [`Line] that plus [lead] of everything pending after it, walked
-   afresh at each decision. [k] is that pending work, nearest first. *)
-let render ?(fit = `Content) ~measure ~width d =
+(* [fit] chooses what a group measures when it decides: under [Content] its own
+   flat width, and under [Line] that plus [lead] of everything pending after it,
+   walked afresh at each decision. [k] is that pending work, nearest first.
+   [Surface] has a [Line] of its own, so the rule's constructors are written
+   qualified. *)
+let render ?(fit = Handsome.Content) ~measure ~width d =
   let b = Buffer.create 256 in
   let line = ref 0 in
   let declined = ref [] in
@@ -167,8 +169,8 @@ let render ?(fit = `Content) ~measure ~width d =
   in
   let tail k =
     match fit with
-    | `Content -> 0
-    | `Line -> fst (lead_seq ~measure k)
+    | Handsome.Content -> 0
+    | Handsome.Line -> fst (lead_seq ~measure k)
   in
   let fits k x =
     match flat_width ~measure x with

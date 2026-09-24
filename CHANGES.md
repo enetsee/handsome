@@ -25,6 +25,10 @@ Also:
   so a list with a trailing comma fits at exactly the width it prints at; the
   one exception, a conditional inside another frame's conditional, is measured
   at its wider branch. `check` reports a conditional used outside its frame.
+- `render ?fit`. Under `Line`, a group measures what follows it on the line up
+  to the next break, as Lindig's strict printer does, so every line holding a
+  declined break stays within the ruler. `Content`, the rule of Wadler's printer
+  and of PPrint, stays the default. The rule costs one word per node.
 - `add` must be commutative as well as associative, since a frame adds up its
   conditionals' widths out of document order.
 - Width is a functor parameter with a documented obligation — `measure` must
