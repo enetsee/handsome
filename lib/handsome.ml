@@ -144,8 +144,8 @@ module Make (W : Width.S) = struct
      A frame and each of its conditionals add a lookup in the set of frames laid
      out flat, logarithmic in its size.
 
-     The two are fields of an inline record, a [bool] and a [W.t], with the
-     [W.t] a placeholder where the [bool] is false. The alternative encoding is
+     The two are fields of an inline record, a bit of [flags] and a [W.t], with
+     the [W.t] a placeholder where the bit is clear. The alternative encoding is
      [W.t option].
 
      [W.t] is abstract, so it holds no value that can stand for infinity, and
@@ -154,7 +154,8 @@ module Make (W : Width.S) = struct
 
      The option costs an allocation per composite node during construction.
      [Cat (W.t option, _, _)] is a four-word block plus a two-word [Some]; the
-     inline record is a five-word block. Measured on a 200k-group document,
+     inline record was a five-word block when this was measured, before [lead]
+     made it six. Measured on a 200k-group document,
      non-flambda, against the option encoding in one process: 17.0 Mwords
      allocated falls to 14.2, and construction is 1.15x faster. Rendering and
      [to_string] hold steady, the cached width being read during the fit test
@@ -168,6 +169,17 @@ module Make (W : Width.S) = struct
 
      [flattenable] and the fit test in [step] are the only readers of these
      fields, and both consult the flag first.
+
+     A second pair, [lead] and [breaks], measures the node laid out broken: the
+     width it puts on the line it starts on, and whether a break ends that line
+     inside it. Every conditional takes its broken branch, and a group or frame
+     inside counts at its flat width, since it decides for itself when it is
+     reached. The pair measures what is pending when a group decides, which is
+     always laid out broken, because a group only decides while everything
+     around it is. [Group] derives both from [req], and [Free] reads them from
+     [inside], so the other composite nodes carry them: [lead] as a field, and
+     [breaks] as the second bit of [flags]. The renderer keeps the
+     pending work's share of the line in [tail] as it goes.
      ------------------------------------------------------------------------ *)
 
   (* A frame's name. [framed] takes a fresh one for each frame and hands the
@@ -398,38 +410,43 @@ module Make (W : Width.S) = struct
     | Text of W.t * string
     | Hard
     | Cat of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; l : 'a t
         ; r : 'a t
         }
     | Alt of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; f : 'a t
         ; b : 'a t
         }
     (* [f] is taken when the enclosing group is flat, [b] when it is broken; the
        requirement is [f]'s. *)
     | Group of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
         ; d : 'a t
         }
     | Nest of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; j : int
         ; d : 'a t
         }
     | Align of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; d : 'a t
         }
     | Annot of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; a : 'a
         ; d : 'a t
         }
@@ -438,14 +455,16 @@ module Make (W : Width.S) = struct
        [Frame]'s requirement has its own conditionals at their flat branch, and
        [Falt]'s is its broken branch's; see above. *)
     | Frame of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; tag : tag
         ; d : 'a t
         }
     | Falt of
-        { flattenable : bool
+        { flags : int
         ; req : W.t
+        ; lead : W.t
         ; tag : tag
         ; f : 'a t
         ; b : 'a t
@@ -475,17 +494,26 @@ module Make (W : Width.S) = struct
   (* [flat_width] carries a width where [flattenable] is true, and a placeholder
      on [Hard] and on anything holding it in flat position. *)
 
+  (* The two flags share one field, since an OCaml record spends a word on each
+     [bool]. [flattenable] is the low bit and [breaks] the next. *)
+  let[@inline] flags ~flattenable ~breaks =
+    (if flattenable then 1 else 0) lor if breaks then 2 else 0
+  ;;
+
+  let[@inline] flattenable_bit f = f land 1 <> 0
+  let[@inline] breaks_bit f = f land 2 <> 0
+
   let flattenable = function
     | Empty | Text _ -> true
     | Hard -> false
-    | Cat r -> r.flattenable
-    | Alt r -> r.flattenable
-    | Group r -> r.flattenable
-    | Nest r -> r.flattenable
-    | Align r -> r.flattenable
-    | Annot r -> r.flattenable
-    | Frame r -> r.flattenable
-    | Falt r -> r.flattenable
+    | Cat r -> flattenable_bit r.flags
+    | Alt r -> flattenable_bit r.flags
+    | Group r -> flattenable_bit r.flags
+    | Nest r -> flattenable_bit r.flags
+    | Align r -> flattenable_bit r.flags
+    | Annot r -> flattenable_bit r.flags
+    | Frame r -> flattenable_bit r.flags
+    | Falt r -> flattenable_bit r.flags
     | Free r -> r.all_ok
   ;;
 
@@ -501,6 +529,34 @@ module Make (W : Width.S) = struct
     | Frame r -> r.req
     | Falt r -> r.req
     | Free r -> r.all_w
+  ;;
+
+  (* A [Free]'s [inside] is never a [Free], so each recurses at most once. *)
+  let rec lead = function
+    | Empty | Hard -> W.zero
+    | Text (w, _) -> w
+    | Cat r -> r.lead
+    | Alt r -> r.lead
+    | Group r -> r.req
+    | Nest r -> r.lead
+    | Align r -> r.lead
+    | Annot r -> r.lead
+    | Frame r -> r.lead
+    | Falt r -> r.lead
+    | Free r -> lead r.inside
+  ;;
+
+  let rec breaks = function
+    | Empty | Text _ | Group _ -> false
+    | Hard -> true
+    | Cat r -> breaks_bit r.flags
+    | Alt r -> breaks_bit r.flags
+    | Nest r -> breaks_bit r.flags
+    | Align r -> breaks_bit r.flags
+    | Annot r -> breaks_bit r.flags
+    | Frame r -> breaks_bit r.flags
+    | Falt r -> breaks_bit r.flags
+    | Free r -> breaks r.inside
   ;;
 
   (* -- constructors -------------------------------------------------------- *)
@@ -600,7 +656,10 @@ module Make (W : Width.S) = struct
   let[@inline] cat x y =
     let flattenable = flattenable x && flattenable y in
     let req = if flattenable then W.add (flat_width x) (flat_width y) else W.zero in
-    Cat { flattenable; req; l = x; r = y }
+    let lead, breaks =
+      if breaks x then lead x, true else W.add (lead x) (lead y), breaks y
+    in
+    Cat { flags = flags ~flattenable ~breaks; req; lead; l = x; r = y }
   ;;
 
   let ( ^^ ) x y =
@@ -629,7 +688,15 @@ module Make (W : Width.S) = struct
      enclosing group broken. For the same reason only [a]'s free conditionals
      reach the region above: [b] is printed only where the group around the
      [flat_alt] broke, and no group around it measures [b]. *)
-  let alt a b = Alt { flattenable = flattenable a; req = flat_width a; f = a; b }
+  let alt a b =
+    Alt
+      { flags = flags ~flattenable:(flattenable a) ~breaks:(breaks b)
+      ; req = flat_width a
+      ; lead = lead b
+      ; f = a
+      ; b
+      }
+  ;;
 
   let flat_alt a b =
     if is_free a
@@ -643,7 +710,10 @@ module Make (W : Width.S) = struct
   let line = flat_alt (text " ") hardline
   let softline = flat_alt empty hardline
   let blank = flat_alt (text " ") empty
-  let group_node d = Group { flattenable = true; req = flat_width d; d }
+
+  let group_node d =
+    Group { flags = flags ~flattenable:true ~breaks:false; req = flat_width d; d }
+  ;;
 
   (* A group holding a hardline in flat position is dropped: it would always be
      laid out broken. The output is identical either way, and [pp] and the
@@ -685,7 +755,16 @@ module Make (W : Width.S) = struct
       let rest = f_remove tag r.frees in
       let flattenable = fixed_ok && broken_ok_of rest in
       let req = if flattenable then W.add fixed (broken_w_of rest) else W.zero in
-      region fixed fixed_ok rest (Frame { flattenable; req; tag; d = r.inside }))
+      (* Laid out broken where it cannot be flat, and then it measures as its
+         body does. *)
+      let lead, breaks =
+        if flattenable then req, false else lead r.inside, breaks r.inside
+      in
+      region
+        fixed
+        fixed_ok
+        rest
+        (Frame { flags = flags ~flattenable ~breaks; req; lead; tag; d = r.inside }))
   ;;
 
   (* A conditional is free until its frame, so it is measured at its broken
@@ -700,7 +779,15 @@ module Make (W : Width.S) = struct
       { fixed = W.zero
       ; fixed_ok = true
       ; frees = f_node F_leaf tag e F_leaf
-      ; inside = Falt { flattenable = broken_ok; req; tag; f = a; b }
+      ; inside =
+          Falt
+            { flags = flags ~flattenable:broken_ok ~breaks:(breaks b)
+            ; req
+            ; lead = lead b
+            ; tag
+            ; f = a
+            ; b
+            }
       ; all_w = req
       ; all_ok = broken_ok
       }
@@ -714,7 +801,15 @@ module Make (W : Width.S) = struct
     frame tag (body (frame_alt tag))
   ;;
 
-  let nest_node j d = Nest { flattenable = flattenable d; req = flat_width d; j; d }
+  let nest_node j d =
+    Nest
+      { flags = flags ~flattenable:(flattenable d) ~breaks:(breaks d)
+      ; req = flat_width d
+      ; lead = lead d
+      ; j
+      ; d
+      }
+  ;;
 
   let nest j d =
     if is_empty d || j = 0
@@ -726,7 +821,14 @@ module Make (W : Width.S) = struct
     else nest_node j d
   ;;
 
-  let align_node d = Align { flattenable = flattenable d; req = flat_width d; d }
+  let align_node d =
+    Align
+      { flags = flags ~flattenable:(flattenable d) ~breaks:(breaks d)
+      ; req = flat_width d
+      ; lead = lead d
+      ; d
+      }
+  ;;
 
   let align d =
     if is_empty d
@@ -740,7 +842,15 @@ module Make (W : Width.S) = struct
 
   (* Kept for [Empty] as well. An annotated empty region is a position in the
      stream, which a source map can use. *)
-  let annotate_node a d = Annot { flattenable = flattenable d; req = flat_width d; a; d }
+  let annotate_node a d =
+    Annot
+      { flags = flags ~flattenable:(flattenable d) ~breaks:(breaks d)
+      ; req = flat_width d
+      ; lead = lead d
+      ; a
+      ; d
+      }
+  ;;
 
   let annotate a d =
     if is_free d
@@ -1237,11 +1347,13 @@ module Make (W : Width.S) = struct
     ; s_pending : int ref option
     ; s_pending_v : int
     ; s_declined : (int * W.t) list
+    ; s_tail : W.t
     }
 
   type 'a kont =
     | KNil
-    | KDoc of 'a t * 'a kont
+    (* The pending document, and [tail] as it stands after it. *)
+    | KDoc of 'a t * W.t * 'a kont
     | KRestore of int * bool * 'a kont
     | KPop of 'a kont
     | KGroup of snap * 'a t * 'a kont
@@ -1273,6 +1385,9 @@ module Make (W : Width.S) = struct
          branch. *)
       mutable flat_frames : Tag_set.t
     ; mutable k : 'a kont
+    ; (* The width the pending work in [k] puts on the current line, up to its
+         first break. Kept on every push and pop, and read by no decision yet. *)
+      mutable tail : W.t
     }
 
   (* Raised by a hardline reached in flat mode, and caught in [drive], which
@@ -1320,6 +1435,7 @@ module Make (W : Width.S) = struct
          | Some r -> !r
          | None -> 0)
     ; s_declined = st.declined_rev
+    ; s_tail = st.tail
     }
   ;;
 
@@ -1333,14 +1449,16 @@ module Make (W : Width.S) = struct
     (match s.s_pending with
      | Some r -> r := s.s_pending_v
      | None -> ());
-    st.declined_rev <- s.s_declined
+    st.declined_rev <- s.s_declined;
+    st.tail <- s.s_tail
   ;;
 
   let rec run st =
     match st.k with
     | KNil -> ()
-    | KDoc (d, k) ->
+    | KDoc (d, tail, k) ->
       st.k <- k;
+      st.tail <- tail;
       step st d
     | KRestore (i, f, k) ->
       st.indent <- i;
@@ -1374,7 +1492,8 @@ module Make (W : Width.S) = struct
         emit_break st;
         run st)
     | Cat r ->
-      st.k <- KDoc (r.r, st.k);
+      st.k <- KDoc (r.r, st.tail, st.k);
+      if breaks r.r then st.tail <- lead r.r else st.tail <- W.add (lead r.r) st.tail;
       step st r.l
     | Alt r ->
       if st.flat
@@ -1403,9 +1522,9 @@ module Make (W : Width.S) = struct
            follows from that and the state stands. *)
         step st r.d
       else (
-        (* [r.flattenable] is left unread. [group] returns its argument
-           unchanged when the flag is clear, so every [Group] node that exists
-           carries it true, and ['a t] is abstract, so none can be built
+        (* [r.flags] is left unread. [group] returns its argument
+           unchanged when [flattenable] is false, so every [Group] node that
+           exists carries that bit set, and ['a t] is abstract, so none can be built
            elsewhere. Worth spelling out here because the field is in scope:
            reading it would imply it could be false. *)
         let fits = W.compare (W.add st.column r.req) st.ruler <= 0 in
@@ -1423,7 +1542,7 @@ module Make (W : Width.S) = struct
         st.k <- KFrames (st.flat_frames, st.k);
         st.flat_frames <- Tag_set.add r.tag st.flat_frames;
         step st r.d)
-      else if not r.flattenable
+      else if not (flattenable_bit r.flags)
       then (* A hardline inside it, so it is laid out broken. *)
         step st r.d
       else (
@@ -1464,7 +1583,7 @@ module Make (W : Width.S) = struct
     | KNil -> None
     | KGroup (s, d, k) -> Some (s, d, k, before)
     | KFrames (fs, k) -> unwind (Some fs) k
-    | KDoc (_, k) | KRestore (_, _, k) | KPop k -> unwind before k
+    | KDoc (_, _, k) | KRestore (_, _, k) | KPop k -> unwind before k
   ;;
 
   (* Recovery from a hardline reached in flat mode. Flat mode is entered where
@@ -1488,9 +1607,9 @@ module Make (W : Width.S) = struct
      the correct layout when it runs.
 
      TODO: decide whether this stays; the question is still open. The branch
-     cannot run, so its cost buys nothing today: [snapshot] allocates nine words
+     cannot run, so its cost buys nothing today: [snapshot] allocates ten words
      on every group that fits, and the ordinary exit at [KGroup] reads two of
-     the eight fields it captured. The other six are there for the rewind below.
+     the nine fields it captured. The other seven are there for the rewind below.
 
      The numbers, so the next reader can skip measuring them. Substituting
      [KRestore] for [KGroup] and dropping [snapshot] came out at -27% allocation
@@ -1537,7 +1656,7 @@ module Make (W : Width.S) = struct
          restore st s;
          Option.iter (fun fs -> st.flat_frames <- fs) before;
          st.flat <- false;
-         st.k <- KDoc (d, KRestore (s.s_indent, s.s_flat, k));
+         st.k <- KDoc (d, s.s_tail, KRestore (s.s_indent, s.s_flat, k));
          drive st
        | None -> ())
   ;;
@@ -1554,7 +1673,8 @@ module Make (W : Width.S) = struct
       ; len = 0
       ; declined_rev = []
       ; flat_frames = Tag_set.empty
-      ; k = KDoc (d, KNil)
+      ; k = KDoc (d, W.zero, KNil)
+      ; tail = W.zero
       }
     in
     drive st;

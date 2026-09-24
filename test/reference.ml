@@ -65,6 +65,40 @@ let rec measure_at ~measure ~wider depth : Surface.t -> int option = function
 
 let flat_width ~measure d = measure_at ~measure ~wider:false 0 d
 
+(* What [d] puts on the line it starts on when laid out broken, and whether a
+   break ends that line inside it: the share of the line a pending document
+   takes, which is what the [`Line] rule adds to a group's own width.
+
+   Everything pending when a group decides is laid out broken, because a group
+   only decides while every group and frame around it is broken. So a
+   conditional counts at its broken branch here. A group or frame inside counts
+   at its flat width, since it decides for itself when it is reached; that is
+   the assumption Lindig's [fits] makes. One that cannot be laid out flat is laid
+   out broken, and counts as its content does. *)
+let rec lead ~measure : Surface.t -> int * bool = function
+  | Text s -> measure s, false
+  | Empty | Blank -> 0, false
+  | Line | Softline | Hardline -> 0, true
+  | Cat (a, b) -> lead_seq ~measure [ a; b ]
+  | Concat ds -> lead_seq ~measure ds
+  | Flat_alt (_, b) | Frame_alt (_, _, b) -> lead ~measure b
+  | Nest (_, d) | Align d | Annot (_, d) -> lead ~measure d
+  | (Group d | Framed d) as g ->
+    (match flat_width ~measure g with
+     | Some w -> w, false
+     | None -> lead ~measure d)
+
+and lead_seq ~measure = function
+  | [] -> 0, false
+  | d :: ds ->
+    let w, b = lead ~measure d in
+    if b
+    then w, true
+    else (
+      let w', b' = lead_seq ~measure ds in
+      w + w', b')
+;;
+
 type rendered =
   { bytes : string
   ; declined : (int * int) list
@@ -102,7 +136,10 @@ let flat d =
     Some (Buffer.contents b)
 ;;
 
-let render ~measure ~width d =
+(* [fit] chooses what a group measures when it decides: [`Content] is its own
+   flat width, [`Line] that plus [lead] of everything pending after it, walked
+   afresh at each decision. [k] is that pending work, nearest first. *)
+let render ?(fit = `Content) ~measure ~width d =
   let b = Buffer.create 256 in
   let line = ref 0 in
   let declined = ref [] in
@@ -128,36 +165,44 @@ let render ~measure ~width d =
     column := i;
     incr line
   in
-  let fits x =
+  let tail k =
+    match fit with
+    | `Content -> 0
+    | `Line -> fst (lead_seq ~measure k)
+  in
+  let fits k x =
     match flat_width ~measure x with
-    | Some w -> !column + w <= width
+    | Some w -> !column + w + tail k <= width
     | None -> false
   in
-  let rec go indent flat frames d =
+  let rec go indent flat frames k d =
     match d with
     | Text s -> emit s
     | Empty -> ()
     | Cat (a, c) ->
-      go indent flat frames a;
-      go indent flat frames c
-    | Concat ds -> List.iter ~f:(go indent flat frames) ds
+      go indent flat frames (c :: k) a;
+      go indent flat frames k c
+    | Concat [] -> ()
+    | Concat (x :: xs) ->
+      go indent flat frames (Concat xs :: k) x;
+      go indent flat frames k (Concat xs)
     | Flat_alt (a, c) ->
       if flat
       then (
         declined := (!line, !column) :: !declined;
-        go indent flat frames a)
-      else go indent flat frames c
-    | Line -> go indent flat frames (Flat_alt (Text " ", Hardline))
-    | Softline -> go indent flat frames (Flat_alt (Empty, Hardline))
-    | Blank -> go indent flat frames (Flat_alt (Text " ", Empty))
+        go indent flat frames k a)
+      else go indent flat frames k c
+    | Line -> go indent flat frames k (Flat_alt (Text " ", Hardline))
+    | Softline -> go indent flat frames k (Flat_alt (Empty, Hardline))
+    | Blank -> go indent flat frames k (Flat_alt (Text " ", Empty))
     | Hardline -> brk indent
-    | Group x -> go indent (flat || fits x) frames x
-    | Nest (j, x) -> go (indent + j) flat frames x
-    | Align x -> go !column flat frames x
-    | Annot (_, x) -> go indent flat frames x
+    | Group x -> go indent (flat || fits k x) frames k x
+    | Nest (j, x) -> go (indent + j) flat frames k x
+    | Align x -> go !column flat frames k x
+    | Annot (_, x) -> go indent flat frames k x
     | Framed x ->
-      let resolved = flat || fits d in
-      go indent resolved (resolved :: frames) x
+      let resolved = flat || fits k d in
+      go indent resolved (resolved :: frames) k x
     (* Recorded in [declined] where it takes its flat branch, as a [Flat_alt]
        is. *)
     | Frame_alt (i, a, c) ->
@@ -169,9 +214,9 @@ let render ~measure ~width d =
       if take_flat
       then (
         declined := (!line, !column) :: !declined;
-        go indent flat frames a)
-      else go indent flat frames c
+        go indent flat frames k a)
+      else go indent flat frames k c
   in
-  go 0 false [] d;
+  go 0 false [] [] d;
   { bytes = Buffer.contents b; declined = List.rev !declined }
 ;;
