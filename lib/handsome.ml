@@ -119,6 +119,7 @@ module type S = sig
   val group : 'a t -> 'a t
   val nest : int -> 'a t -> 'a t
   val align : 'a t -> 'a t
+  val from_line : 'a t -> 'a t
   val framed : (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
   val annotate : 'a -> 'a t -> 'a t
   val reannotate : ('a -> 'b) -> 'a t -> 'b t
@@ -454,6 +455,9 @@ module Make (W : Width.S) = struct
         { flags : int
         ; req : W.t
         ; lead : W.t
+        ; to_line : bool
+          (* The level comes from the line [d] starts on rather than from the
+             column. [from_line] builds this one. *)
         ; d : 'a t
         }
     | Annot of
@@ -834,24 +838,28 @@ module Make (W : Width.S) = struct
     else nest_node j d
   ;;
 
-  let align_node d =
+  let align_node ~to_line d =
     Align
       { flags = flags ~flattenable:(flattenable d) ~breaks:(breaks d)
       ; req = flat_width d
       ; lead = lead d
+      ; to_line
       ; d
       }
   ;;
 
-  let align d =
+  let aligned ~to_line d =
     if is_empty d
     then d
     else if is_free d
     then (
       let r = view d in
-      rewrap r (align_node r.inside))
-    else align_node d
+      rewrap r (align_node ~to_line r.inside))
+    else align_node ~to_line d
   ;;
+
+  let align d = aligned ~to_line:false d
+  let from_line d = aligned ~to_line:true d
 
   (* Kept for [Empty] as well. An annotated empty region is a position in the
      stream, which a source map can use. *)
@@ -911,7 +919,7 @@ module Make (W : Width.S) = struct
     | R_alt_done of 'b t * ('a, 'b) rebuild
     | R_group of ('a, 'b) rebuild
     | R_nest of int * ('a, 'b) rebuild
-    | R_align of ('a, 'b) rebuild
+    | R_align of bool * ('a, 'b) rebuild
     | R_annot of 'b * ('a, 'b) rebuild
     | R_frame of tag * ('a, 'b) rebuild
     | R_falt_todo of tag * 'a t * ('a, 'b) rebuild
@@ -927,7 +935,7 @@ module Make (W : Width.S) = struct
       | Alt r -> down r.f (R_alt_todo (r.b, k))
       | Group r -> down r.d (R_group k)
       | Nest r -> down r.d (R_nest (r.j, k))
-      | Align r -> down r.d (R_align k)
+      | Align r -> down r.d (R_align (r.to_line, k))
       | Annot r -> down r.d (R_annot (fn r.a, k))
       | Frame r -> down r.d (R_frame (r.tag, k))
       | Falt r -> down r.f (R_falt_todo (r.tag, r.b, k))
@@ -941,7 +949,7 @@ module Make (W : Width.S) = struct
       | R_alt_done (f, k) -> up (flat_alt f v) k
       | R_group k -> up (group v) k
       | R_nest (j, k) -> up (nest j v) k
-      | R_align k -> up (align v) k
+      | R_align (to_line, k) -> up (aligned ~to_line v) k
       | R_annot (a, k) -> up (annotate a v) k
       | R_frame (tag, k) -> up (frame tag v) k
       | R_falt_todo (tag, b, k) -> down b (R_falt_done (tag, v, k))
@@ -961,7 +969,7 @@ module Make (W : Width.S) = struct
       | Alt r -> down r.f (R_alt_todo (r.b, k))
       | Group r -> down r.d (R_group k)
       | Nest r -> down r.d (R_nest (r.j, k))
-      | Align r -> down r.d (R_align k)
+      | Align r -> down r.d (R_align (r.to_line, k))
       | Annot r -> down r.d k
       | Frame r -> down r.d (R_frame (r.tag, k))
       | Falt r -> down r.f (R_falt_todo (r.tag, r.b, k))
@@ -975,7 +983,7 @@ module Make (W : Width.S) = struct
       | R_alt_done (f, k) -> up (flat_alt f v) k
       | R_group k -> up (group v) k
       | R_nest (j, k) -> up (nest j v) k
-      | R_align k -> up (align v) k
+      | R_align (to_line, k) -> up (aligned ~to_line v) k
       | R_annot ((), k) -> up v k
       | R_frame (tag, k) -> up (frame tag v) k
       | R_falt_todo (tag, b, k) -> down b (R_falt_done (tag, v, k))
@@ -1141,7 +1149,7 @@ module Make (W : Width.S) = struct
            Format.pp_print_int ppf r.j;
            go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
          | Align r ->
-           enter "(align";
+           enter (if r.to_line then "(from_line" else "(align");
            go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
          | Annot r ->
            enter "(annotate";
@@ -1356,6 +1364,7 @@ module Make (W : Width.S) = struct
     ; s_flat : bool
     ; s_column : W.t
     ; s_line : int
+    ; s_line_indent : int
     ; s_len : int
     ; s_pending : int ref option
     ; s_pending_v : int
@@ -1381,6 +1390,11 @@ module Make (W : Width.S) = struct
     ; mutable flat : bool
     ; mutable column : W.t
     ; mutable line : int
+    ; (* The indentation the current line started with. [from_line] reads it.
+         Only [emit_break] sets it, as with [line], and flat mode emits no
+         break, so a group that backtracks finds it as it was. [snapshot]
+         carries it all the same, the way it carries [line]. *)
+      mutable line_indent : int
     ; (* The most recent line break, holding the indentation it will emit once
          text lands on that line. A line that stays empty has this set to zero,
          so the indentation the engine emits is always followed by something.
@@ -1435,6 +1449,7 @@ module Make (W : Width.S) = struct
     push st (O_line r);
     st.pending <- Some r;
     st.line <- st.line + 1;
+    st.line_indent <- ind;
     st.column <- indent_width ind
   ;;
 
@@ -1443,6 +1458,7 @@ module Make (W : Width.S) = struct
     ; s_flat = st.flat
     ; s_column = st.column
     ; s_line = st.line
+    ; s_line_indent = st.line_indent
     ; s_len = st.len
     ; s_pending = st.pending
     ; s_pending_v =
@@ -1459,6 +1475,7 @@ module Make (W : Width.S) = struct
     st.flat <- s.s_flat;
     st.column <- s.s_column;
     st.line <- s.s_line;
+    st.line_indent <- s.s_line_indent;
     st.len <- s.s_len;
     st.pending <- s.s_pending;
     (match s.s_pending with
@@ -1532,7 +1549,7 @@ module Make (W : Width.S) = struct
       step st r.d
     | Align r ->
       st.k <- KRestore (st.indent, st.flat, st.k);
-      st.indent <- spaces_for st.column;
+      st.indent <- (if r.to_line then st.line_indent else spaces_for st.column);
       step st r.d
     | Annot r ->
       push st (O_push r.a);
@@ -1691,6 +1708,7 @@ module Make (W : Width.S) = struct
       ; flat = false
       ; column = W.zero
       ; line = 0
+      ; line_indent = 0
       ; pending = None
       ; buf = Array.make 32 O_pop
       ; len = 0

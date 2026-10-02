@@ -165,6 +165,10 @@ let read (s : string) : unit H.t =
          let d = doc () in
          expect_rpar ();
          H.align d
+       | Atom "from_line" ->
+         let d = doc () in
+         expect_rpar ();
+         H.from_line d
        | Atom "annotate" ->
          let d = doc () in
          expect_rpar ();

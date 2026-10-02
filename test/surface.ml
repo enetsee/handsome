@@ -25,6 +25,7 @@ type t =
   | Group of t
   | Nest of int * t
   | Align of t
+  | From_line of t
   | Annot of int * t
   | Framed of t
   | Frame_alt of int * t * t
@@ -67,6 +68,7 @@ module Doc (H : DOC) = struct
       | Group d -> H.group (go alts d)
       | Nest (j, d) -> H.nest j (go alts d)
       | Align d -> H.align (go alts d)
+      | From_line d -> H.from_line (go alts d)
       | Annot (a, d) -> H.annotate a (go alts d)
       | Framed d -> H.framed (fun alt -> go (alt :: alts) d)
       | Frame_alt (i, a, b) ->
@@ -101,11 +103,13 @@ let to_doc = Ascii_doc.to_doc
 
    PPrint has no conditional on an outer group, so [Frame_alt] has no
    counterpart and both mappings reject it. [Framed] with nothing reading its tag
-   is a group, and maps to one.
+   is a group, and maps to one. PPrint indents from a column or from the
+   enclosing nest, never from the line a document starts on, so [From_line] has
+   no counterpart either.
    -------------------------------------------------------------------------- *)
 
-let no_counterpart () =
-  invalid_arg "Surface.to_pprint: a frame's conditional has no PPrint counterpart"
+let no_counterpart (what : string) =
+  invalid_arg ("Surface.to_pprint: " ^ what ^ " has no PPrint counterpart")
 ;;
 
 let ( ^^ ) = PPrint.( ^^ )
@@ -124,9 +128,10 @@ let rec to_pprint : t -> PPrint.document = function
   | Group d -> PPrint.group (to_pprint d)
   | Nest (j, d) -> PPrint.nest j (to_pprint d)
   | Align d -> PPrint.align (to_pprint d)
+  | From_line _ -> no_counterpart "from_line"
   | Annot (_, d) -> to_pprint d
   | Framed d -> PPrint.group (to_pprint d)
-  | Frame_alt _ -> no_counterpart ()
+  | Frame_alt _ -> no_counterpart "a frame's conditional"
 ;;
 
 let rec to_pprint_idiomatic : t -> PPrint.document = function
@@ -146,9 +151,10 @@ let rec to_pprint_idiomatic : t -> PPrint.document = function
   | Group d -> PPrint.group (to_pprint_idiomatic d)
   | Nest (j, d) -> PPrint.nest j (to_pprint_idiomatic d)
   | Align d -> PPrint.align (to_pprint_idiomatic d)
+  | From_line _ -> no_counterpart "from_line"
   | Annot (_, d) -> to_pprint_idiomatic d
   | Framed d -> PPrint.group (to_pprint_idiomatic d)
-  | Frame_alt _ -> no_counterpart ()
+  | Frame_alt _ -> no_counterpart "a frame's conditional"
 ;;
 
 let pprint_to_string ?(f = to_pprint) ~width d =
@@ -170,7 +176,7 @@ let rec is_empty = function
   | Empty -> true
   | Cat (a, b) -> is_empty a && is_empty b
   | Concat ds -> List.for_all ~f:is_empty ds
-  | Group d | Nest (_, d) | Align d | Framed d -> is_empty d
+  | Group d | Nest (_, d) | Align d | From_line d | Framed d -> is_empty d
   | Annot _ | Flat_alt _ | Line | Softline | Hardline | Blank | Frame_alt _ -> false
 ;;
 
@@ -195,7 +201,7 @@ let offenders d =
       go scope a;
       go scope b
     | Concat ds -> List.iter ~f:(go scope) ds
-    | Group d | Nest (_, d) | Align d | Annot (_, d) -> go scope d
+    | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) -> go scope d
     | Framed d -> if not (is_empty d) then go (fresh () :: scope) d
     | Frame_alt (i, a, b) ->
       if i >= List.length scope then acc := Outside (fresh ()) :: !acc;
@@ -214,7 +220,7 @@ let rec has_free depth = function
   | Framed d -> has_free (depth + 1) d
   | Cat (a, b) | Flat_alt (a, b) -> has_free depth a || has_free depth b
   | Concat ds -> List.exists ~f:(has_free depth) ds
-  | Group d | Nest (_, d) | Align d | Annot (_, d) -> has_free depth d
+  | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) -> has_free depth d
   | Text _ | Empty | Line | Softline | Hardline | Blank -> false
 ;;
 
@@ -222,7 +228,8 @@ let rec has_free depth = function
    which the interface measures at its wider branch. *)
 let rec nested_free = function
   | Frame_alt (_, a, b) -> has_free 0 a || has_free 0 b || nested_free a || nested_free b
-  | Framed d | Group d | Nest (_, d) | Align d | Annot (_, d) -> nested_free d
+  | Framed d | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
+    nested_free d
   | Cat (a, b) | Flat_alt (a, b) -> nested_free a || nested_free b
   | Concat ds -> List.exists ~f:nested_free ds
   | Text _ | Empty | Line | Softline | Hardline | Blank -> false
@@ -243,6 +250,7 @@ let rec show = function
   | Group d -> Printf.sprintf "(group %s)" (show d)
   | Nest (j, d) -> Printf.sprintf "(nest %d %s)" j (show d)
   | Align d -> Printf.sprintf "(align %s)" (show d)
+  | From_line d -> Printf.sprintf "(from_line %s)" (show d)
   | Annot (a, d) -> Printf.sprintf "(annotate %d %s)" a (show d)
   | Framed d -> Printf.sprintf "(framed %s)" (show d)
   | Frame_alt (i, a, b) -> Printf.sprintf "(frame_alt %d %s %s)" i (show a) (show b)
@@ -269,6 +277,10 @@ type flavour =
     (** [align] is one of exactly two ways the measure reaches the output --
           it turns a column into an indentation -- so a property about the other
           way, the fit decision, has to be able to switch it off. *)
+  ; from_lines : bool
+    (** [from_line]. PPrint has nothing that indents from the line a document
+          starts on, so the differential corpora leave it off. {!Reference} is
+          the second implementation it is checked against. *)
   ; frames : bool
     (** [framed] and its conditionals. PPrint has no conditional on an outer
           group, so the differential corpora leave these off, and [framed] is
@@ -285,6 +297,7 @@ let plain =
   ; unicode = false
   ; malformed = false
   ; aligns = true
+  ; from_lines = false
   ; frames = false
   }
 ;;
@@ -293,7 +306,7 @@ let rich = { plain with annotations = true; general_flat_alt = true; unicode = t
 
 (* Well-formed UTF-8, exercising dedent and frames, which PPrint cannot
    express. *)
-let wild = { rich with neg_nest = true; frames = true }
+let wild = { rich with neg_nest = true; from_lines = true; frames = true }
 let no_align = { wild with aligns = false }
 
 (* [wild] restricted to the derived breaks, whose two branches differ in
@@ -389,6 +402,19 @@ let gen flavour =
          @ (if flavour.aligns
             then
               [ 2, Gen.map (fun d -> Align d) (Gen.sized_size (Gen.pure (n - 1)) node) ]
+            else [])
+         @ (if flavour.from_lines
+            then
+              [ 2, Gen.map (fun d -> From_line d) (Gen.sized_size (Gen.pure (n - 1)) node)
+                (* The shape it is for: a header that may break, then a block
+                   that opens on the header's last line and indents from it. *)
+              ; ( 2
+                , Gen.map3
+                    (fun j h b -> Nest (j, Cat (Group h, From_line (Nest (j, b)))))
+                    (Gen.int_range 1 4)
+                    half
+                    half )
+              ]
             else [])
          @ (if flavour.general_flat_alt
             then [ 2, Gen.map2 (fun a b -> Flat_alt (a, b)) half half ]

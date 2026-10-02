@@ -29,6 +29,11 @@ Also:
   to the next break, as Lindig's strict printer does, so every line holding a
   declined break stays within the ruler. `Content`, the rule of Wadler's printer
   and of PPrint, stays the default. The rule costs one word per node.
+- `from_line`: indentation taken from the line a document starts on. `align`
+  takes it from the column. A block that opens on a header's last line, as in
+  `def f() = {`, indents from that line whether the header fitted on one or
+  broke over several. PPrint has nothing like it, so the PPrint differential
+  leaves it out and the reference renderer in the test suite checks it.
 - `add` must be commutative as well as associative, since a frame adds up its
   conditionals' widths out of document order.
 - Width is a functor parameter with a documented obligation — `measure` must

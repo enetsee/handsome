@@ -348,7 +348,14 @@ module Make (P : INSTANCE) = struct
      broken; the edit lets it lay out flat and take the other branch, so the
      recovery never runs there. Where it does run, it produces the correct
      layout. Combining that with a flat-mode hardline that emits
-     nothing reddens [doc/3]. The cached width protects that invariant. *)
+     nothing reddens [doc/3]. The cached width protects that invariant.
+
+     Measured again on 2026-10-02, after [fit] and [framed]. The mutation now
+     reddens fit/0, fit/1, fit/3 and laws/18 under both measures, which the
+     paragraph above predates and which were not re-examined. With [from_line]
+     in the corpus it also reddens laws/8 and laws/9. Their counterexample is
+     the case above, a conditional free in another's branch with a hardline in
+     it, and it renders the same with the [from_line] taken out. *)
 
   (* -- stream fidelity ----------------------------------------------------- *)
 

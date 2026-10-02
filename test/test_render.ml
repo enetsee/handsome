@@ -147,6 +147,37 @@ let unit_cases =
           "ab\n  c"
           (H.to_string
              (fst (H.render ~width:1 (H.text "ab" ^^ H.align (H.line ^^ H.text "c"))))) )
+  ; ( "from_line indents from the line it starts on"
+    , `Quick
+    , fun () ->
+        (* The [nest 2] around the whole is not on the line [from_line] starts
+           on, so [b] is one step in from [a] and [c] is back under it. *)
+        Alcotest.(check string)
+          ""
+          "a\n  b\nc"
+          (H.to_string
+             (fst
+                (H.render
+                   ~width:80
+                   (H.nest
+                      2
+                      (H.text "a"
+                       ^^ H.from_line
+                            (H.nest 2 (H.hardline ^^ H.text "b")
+                             ^^ H.hardline
+                             ^^ H.text "c")))))) )
+  ; ( "from_line reads a line a group broke onto, and not one it took back"
+    , `Quick
+    , fun () ->
+        let d =
+          H.nest
+            2
+            (H.group (H.text "aaaa" ^^ H.line ^^ H.text "b")
+             ^^ H.from_line (H.nest 2 (H.hardline ^^ H.text "c")))
+        in
+        let at width = H.to_string (fst (H.render ~width d)) in
+        Alcotest.(check string) "broken" "aaaa\n  b\n    c" (at 3);
+        Alcotest.(check string) "flat" "aaaa b\n  c" (at 80) )
   ; ( "an empty line carries no indentation"
     , `Quick
     , fun () ->

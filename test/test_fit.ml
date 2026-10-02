@@ -204,6 +204,7 @@ let rec seal : Surface.t -> Surface.t = function
   | Flat_alt (a, b) -> Flat_alt (seal a, seal b)
   | Nest (j, d) -> Nest (j, seal d)
   | Align d -> Align (seal d)
+  | From_line d -> From_line (seal d)
   | Annot (a, d) -> Annot (a, seal d)
   | Framed d -> Framed (seal d)
   | Frame_alt (i, a, b) -> Frame_alt (i, seal a, seal b)

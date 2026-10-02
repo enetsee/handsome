@@ -235,6 +235,18 @@ module type S = sig
       is the display column. *)
   val align : 'a t -> 'a t
 
+  (** [from_line d] sets the indentation level to the one the current line
+      started with, so [d]'s lines are indented from the line it starts on.
+
+      It is for a block that opens on a line something else began. A header
+      [def f() = {] may be one line or several, and the block's body sits one
+      step in from whichever line holds the [{]. Under {!nest} the body would
+      take the header's own indentation as well wherever the header broke.
+
+      PPrint has nothing like it, so the differential against PPrint does not
+      reach it. *)
+  val from_line : 'a t -> 'a t
+
   (** {2 Conditionals on an outer group}
 
       {!flat_alt} resolves against the group directly enclosing it. Some choices

@@ -49,7 +49,8 @@ let rec measure_at ~measure ~wider depth : Surface.t -> int option = function
   | Softline -> Some 0
   | Hardline -> None
   | Blank -> Some (measure " ")
-  | Group d | Nest (_, d) | Align d | Annot (_, d) -> measure_at ~measure ~wider depth d
+  | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
+    measure_at ~measure ~wider depth d
   | Framed d -> measure_at ~measure ~wider (depth + 1) d
   | Frame_alt (i, a, b) ->
     let branch x = measure_at ~measure ~wider:true 0 x in
@@ -82,7 +83,7 @@ let rec lead ~measure : Surface.t -> int * bool = function
   | Cat (a, b) -> lead_seq ~measure [ a; b ]
   | Concat ds -> lead_seq ~measure ds
   | Flat_alt (_, b) | Frame_alt (_, _, b) -> lead ~measure b
-  | Nest (_, d) | Align d | Annot (_, d) -> lead ~measure d
+  | Nest (_, d) | Align d | From_line d | Annot (_, d) -> lead ~measure d
   | (Group d | Framed d) as g ->
     (match flat_width ~measure g with
      | Some w -> w, false
@@ -125,7 +126,7 @@ let flat d =
     | Line | Blank -> Buffer.add_char b ' '
     | Softline -> ()
     | Hardline -> assert false (* ruled out by [flat_width] *)
-    | Group d | Nest (_, d) | Align d | Annot (_, d) -> go depth d
+    | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) -> go depth d
     | Framed d -> go (depth + 1) d
     | Frame_alt (i, a, c) -> go depth (if i < depth then a else c)
   in
@@ -150,6 +151,8 @@ let render ?(fit = Handsome.Content) ~measure ~width d =
      with no whitespace, and neither does the last line. *)
   let pending = ref (-1) in
   let column = ref 0 in
+  (* The indentation the current line started with, which [From_line] takes. *)
+  let line_indent = ref 0 in
   let emit s =
     if String.length s > 0
     then (
@@ -165,6 +168,7 @@ let render ?(fit = Handsome.Content) ~measure ~width d =
     Buffer.add_char b '\n';
     pending := i;
     column := i;
+    line_indent := i;
     incr line
   in
   let tail k =
@@ -201,6 +205,7 @@ let render ?(fit = Handsome.Content) ~measure ~width d =
     | Group x -> go indent (flat || fits k x) frames k x
     | Nest (j, x) -> go (indent + j) flat frames k x
     | Align x -> go !column flat frames k x
+    | From_line x -> go !line_indent flat frames k x
     | Annot (_, x) -> go indent flat frames k x
     | Framed x ->
       let resolved = flat || fits k d in
