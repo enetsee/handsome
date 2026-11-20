@@ -49,9 +49,9 @@ let rec measure_at ~measure ~wider depth : Surface.t -> int option = function
   | Softline -> Some 0
   | Hardline -> None
   | Blank -> Some (measure " ")
-  | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
+  | Group d | Yielding d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
     measure_at ~measure ~wider depth d
-  | Framed d -> measure_at ~measure ~wider (depth + 1) d
+  | Framed d | Yielding_framed d -> measure_at ~measure ~wider (depth + 1) d
   | Frame_alt (i, a, b) ->
     let branch x = measure_at ~measure ~wider:true 0 x in
     if i < depth
@@ -75,7 +75,11 @@ let flat_width ~measure d = measure_at ~measure ~wider:false 0 d
    conditional counts at its broken branch here. A group or frame inside counts
    at its flat width, since it decides for itself when it is reached; that is
    the assumption Lindig's [fits] makes. One that cannot be laid out flat is laid
-   out broken, and counts as its content does. *)
+   out broken, and counts as its content does.
+
+   One made with [~yields:true] counts as its content does as well, which is
+   the group laid out broken as far as its first break. Where that comes to
+   more than its flat width, it counts at its flat width. *)
 let rec lead ~measure : Surface.t -> int * bool = function
   | Text s -> measure s, false
   | Empty | Blank -> 0, false
@@ -88,6 +92,10 @@ let rec lead ~measure : Surface.t -> int * bool = function
     (match flat_width ~measure g with
      | Some w -> w, false
      | None -> lead ~measure d)
+  | (Yielding d | Yielding_framed d) as g ->
+    (match flat_width ~measure g, lead ~measure d with
+     | Some w, (l, _) when l > w -> w, false
+     | (Some _ | None), broken -> broken)
 
 and lead_seq ~measure = function
   | [] -> 0, false
@@ -126,8 +134,9 @@ let flat d =
     | Line | Blank -> Buffer.add_char b ' '
     | Softline -> ()
     | Hardline -> assert false (* ruled out by [flat_width] *)
-    | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) -> go depth d
-    | Framed d -> go (depth + 1) d
+    | Group d | Yielding d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
+      go depth d
+    | Framed d | Yielding_framed d -> go (depth + 1) d
     | Frame_alt (i, a, c) -> go depth (if i < depth then a else c)
   in
   match flat_width ~measure:String.length d with
@@ -202,12 +211,12 @@ let render ?(fit = Handsome.Content) ~measure ~width d =
     | Softline -> go indent flat frames k (Flat_alt (Empty, Hardline))
     | Blank -> go indent flat frames k (Flat_alt (Text " ", Empty))
     | Hardline -> brk indent
-    | Group x -> go indent (flat || fits k x) frames k x
+    | Group x | Yielding x -> go indent (flat || fits k x) frames k x
     | Nest (j, x) -> go (indent + j) flat frames k x
     | Align x -> go !column flat frames k x
     | From_line x -> go !line_indent flat frames k x
     | Annot (_, x) -> go indent flat frames k x
-    | Framed x ->
+    | Framed x | Yielding_framed x ->
       let resolved = flat || fits k d in
       go indent resolved (resolved :: frames) k x
     (* Recorded in [declined] where it takes its flat branch, as a [Flat_alt]

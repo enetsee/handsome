@@ -116,11 +116,11 @@ module type S = sig
   val softline : 'a t
   val hardline : 'a t
   val blank : 'a t
-  val group : 'a t -> 'a t
+  val group : ?yields:bool -> 'a t -> 'a t
   val nest : int -> 'a t -> 'a t
   val align : 'a t -> 'a t
   val from_line : 'a t -> 'a t
-  val framed : (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
+  val framed : ?yields:bool -> (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
   val annotate : 'a -> 'a t -> 'a t
   val reannotate : ('a -> 'b) -> 'a t -> 'b t
   val unannotate : 'a t -> unit t
@@ -194,6 +194,13 @@ module Make (W : Width.S) = struct
      [inside], so the other composite nodes carry them: [lead] as a field, and
      [breaks] as the second bit of [flags]. The renderer keeps the
      pending work's share of the line in [tail] as it goes.
+
+     A group made with [~yields:true] is the one group counted another way. It
+     is a [Yielding] node, and pending work counts it as far as its first
+     break, which is its body's own pair, so it carries the pair as the other
+     composite nodes do. A frame already has both and keeps the request in the
+     third bit of [flags]. A document built without [~yields:true] holds no
+     [Yielding] and sets no third bit, so it is built exactly as before.
      ------------------------------------------------------------------------ *)
 
   (* A frame's name. [framed] takes a fresh one for each frame and hands the
@@ -444,6 +451,15 @@ module Make (W : Width.S) = struct
         ; req : W.t
         ; d : 'a t
         }
+    (* A group made with [~yields:true]. It decides as [Group] does, by [req].
+       [lead] and the [breaks] bit are what the groups before it on the line
+       count for it; see [yielded]. *)
+    | Yielding of
+        { flags : int
+        ; req : W.t
+        ; lead : W.t
+        ; d : 'a t
+        }
     | Nest of
         { flags : int
         ; req : W.t
@@ -470,7 +486,8 @@ module Make (W : Width.S) = struct
     (* A group that records how it resolved under [tag], and a conditional that
        reads that record where [Alt] reads the group directly enclosing it.
        [Frame]'s requirement has its own conditionals at their flat branch, and
-       [Falt]'s is its broken branch's; see above. *)
+       [Falt]'s is its broken branch's; see above. The third bit of a [Frame]'s
+       [flags] says it was made with [~yields:true]. *)
     | Frame of
         { flags : int
         ; req : W.t
@@ -512,13 +529,16 @@ module Make (W : Width.S) = struct
      on [Hard] and on anything holding it in flat position. *)
 
   (* The two flags share one field, since an OCaml record spends a word on each
-     [bool]. [flattenable] is the low bit and [breaks] the next. *)
+     [bool]. [flattenable] is the low bit and [breaks] the next. A [Frame] has a
+     third, [yields]. *)
   let[@inline] flags ~flattenable ~breaks =
     (if flattenable then 1 else 0) lor if breaks then 2 else 0
   ;;
 
   let[@inline] flattenable_bit f = f land 1 <> 0
   let[@inline] breaks_bit f = f land 2 <> 0
+  let[@inline] yields_bit f = f land 4 <> 0
+  let[@inline] with_yields ~yields f = if yields then f lor 4 else f
 
   let flattenable = function
     | Empty | Text _ -> true
@@ -526,6 +546,7 @@ module Make (W : Width.S) = struct
     | Cat r -> flattenable_bit r.flags
     | Alt r -> flattenable_bit r.flags
     | Group r -> flattenable_bit r.flags
+    | Yielding r -> flattenable_bit r.flags
     | Nest r -> flattenable_bit r.flags
     | Align r -> flattenable_bit r.flags
     | Annot r -> flattenable_bit r.flags
@@ -540,6 +561,7 @@ module Make (W : Width.S) = struct
     | Cat r -> r.req
     | Alt r -> r.req
     | Group r -> r.req
+    | Yielding r -> r.req
     | Nest r -> r.req
     | Align r -> r.req
     | Annot r -> r.req
@@ -555,6 +577,7 @@ module Make (W : Width.S) = struct
     | Cat r -> r.lead
     | Alt r -> r.lead
     | Group r -> r.req
+    | Yielding r -> r.lead
     | Nest r -> r.lead
     | Align r -> r.lead
     | Annot r -> r.lead
@@ -568,6 +591,7 @@ module Make (W : Width.S) = struct
     | Hard -> true
     | Cat r -> breaks_bit r.flags
     | Alt r -> breaks_bit r.flags
+    | Yielding r -> breaks_bit r.flags
     | Nest r -> breaks_bit r.flags
     | Align r -> breaks_bit r.flags
     | Annot r -> breaks_bit r.flags
@@ -591,6 +615,7 @@ module Make (W : Width.S) = struct
     | Cat _
     | Alt _
     | Group _
+    | Yielding _
     | Nest _
     | Align _
     | Annot _
@@ -607,6 +632,7 @@ module Make (W : Width.S) = struct
     | Cat _
     | Alt _
     | Group _
+    | Yielding _
     | Nest _
     | Align _
     | Annot _
@@ -626,6 +652,7 @@ module Make (W : Width.S) = struct
     | Cat _
     | Alt _
     | Group _
+    | Yielding _
     | Nest _
     | Align _
     | Annot _
@@ -732,17 +759,47 @@ module Make (W : Width.S) = struct
     Group { flags = flags ~flattenable:true ~breaks:false; req = flat_width d; d }
   ;;
 
+  (* What the groups before a yielding group or frame count for it, where it
+     measures [req] flat and [d] is its body: [d]'s lead and whether a break
+     ends it, which is the group laid out broken as far as its first break.
+
+     That is the width it leaves on the line if it breaks. An earlier group
+     that fits on that count lies flat, and the yielding group then makes its
+     own test from its own column: it lies flat where the whole line fits, and
+     breaks otherwise, leaving on the line exactly what was counted. Either way
+     the line stays within the ruler.
+
+     A body can be wider up to its first break than the whole group is flat,
+     since the broken branch of a [flat_alt] can be the wider. The group then
+     counts at [req], as a plain group does. So a yielding group never counts
+     for more than a plain one, and making a group yield never takes an earlier
+     group off its line. *)
+  let yielded req d =
+    let l = lead d in
+    if W.compare l req <= 0 then l, breaks d else req, false
+  ;;
+
+  let yielding_node d =
+    let req = flat_width d in
+    let lead, breaks = yielded req d in
+    Yielding { flags = flags ~flattenable:true ~breaks; req; lead; d }
+  ;;
+
   (* A group holding a hardline in flat position is dropped: it would always be
      laid out broken. The output is identical either way, and [pp] and the
-     document keep to nodes that carry a decision. *)
-  let group d =
+     document keep to nodes that carry a decision. That holds of a yielding
+     group as well: what is left is its body, which counts as far as its first
+     break without the node. *)
+  let group ?(yields = false) d =
     if is_empty d || not (flattenable d)
     then d
-    else if is_free d
-    then (
-      let r = view d in
-      rewrap r (group_node r.inside))
-    else group_node d
+    else (
+      let node = if yields then yielding_node else group_node in
+      if is_free d
+      then (
+        let r = view d in
+        rewrap r (node r.inside))
+      else node d)
   ;;
 
   (* Generated, so no two frames share a tag and a document carries its own
@@ -759,7 +816,7 @@ module Make (W : Width.S) = struct
      branch, as a conditional with no frame does, and the output would be the
      same without the node. [check] would then report the conditionals inside
      as outside their frame. *)
-  let frame tag d =
+  let frame ?(yields = false) tag d =
     if is_empty d
     then d
     else (
@@ -773,15 +830,27 @@ module Make (W : Width.S) = struct
       let flattenable = fixed_ok && broken_ok_of rest in
       let req = if flattenable then W.add fixed (broken_w_of rest) else W.zero in
       (* Laid out broken where it cannot be flat, and then it measures as its
-         body does. *)
+         body does. A yielding frame is counted as [yielded] says. Its own
+         conditionals are at their broken branch in its body's lead, which is
+         the branch they take where it breaks. *)
       let lead, breaks =
-        if flattenable then req, false else lead r.inside, breaks r.inside
+        if not flattenable
+        then lead r.inside, breaks r.inside
+        else if yields
+        then yielded req r.inside
+        else req, false
       in
       region
         fixed
         fixed_ok
         rest
-        (Frame { flags = flags ~flattenable ~breaks; req; lead; tag; d = r.inside }))
+        (Frame
+           { flags = with_yields ~yields (flags ~flattenable ~breaks)
+           ; req
+           ; lead
+           ; tag
+           ; d = r.inside
+           }))
   ;;
 
   (* A conditional is free until its frame, so it is measured at its broken
@@ -813,9 +882,9 @@ module Make (W : Width.S) = struct
   (* The tag is taken before the body is built, because the conditionals that
      read it are inside. The callback is what keeps them inside: [alt] exists
      only while the frame's body is being built. *)
-  let framed body =
+  let framed ?yields body =
     let tag = new_tag () in
-    frame tag (body (frame_alt tag))
+    frame ?yields tag (body (frame_alt tag))
   ;;
 
   let nest_node j d =
@@ -910,18 +979,21 @@ module Make (W : Width.S) = struct
 
      A rebuilt [Frame] or [Falt] keeps its tag. A fresh one would leave the
      conditionals inside looking for a group that is gone. A [Free] node is
-     passed through: the constructors on the way back up put it back. *)
+     passed through: the constructors on the way back up put it back.
+
+     [R_group] and [R_frame] carry whether the node was made with
+     [~yields:true], so the rebuilt one is counted as the original was. *)
   type ('a, 'b) rebuild =
     | R_done
     | R_cat_todo of 'a t * ('a, 'b) rebuild
     | R_cat_done of 'b t * ('a, 'b) rebuild
     | R_alt_todo of 'a t * ('a, 'b) rebuild
     | R_alt_done of 'b t * ('a, 'b) rebuild
-    | R_group of ('a, 'b) rebuild
+    | R_group of bool * ('a, 'b) rebuild
     | R_nest of int * ('a, 'b) rebuild
     | R_align of bool * ('a, 'b) rebuild
     | R_annot of 'b * ('a, 'b) rebuild
-    | R_frame of tag * ('a, 'b) rebuild
+    | R_frame of tag * bool * ('a, 'b) rebuild
     | R_falt_todo of tag * 'a t * ('a, 'b) rebuild
     | R_falt_done of tag * 'b t * ('a, 'b) rebuild
 
@@ -933,11 +1005,12 @@ module Make (W : Width.S) = struct
       | Hard -> up Hard k
       | Cat r -> down r.l (R_cat_todo (r.r, k))
       | Alt r -> down r.f (R_alt_todo (r.b, k))
-      | Group r -> down r.d (R_group k)
+      | Group r -> down r.d (R_group (false, k))
+      | Yielding r -> down r.d (R_group (true, k))
       | Nest r -> down r.d (R_nest (r.j, k))
       | Align r -> down r.d (R_align (r.to_line, k))
       | Annot r -> down r.d (R_annot (fn r.a, k))
-      | Frame r -> down r.d (R_frame (r.tag, k))
+      | Frame r -> down r.d (R_frame (r.tag, yields_bit r.flags, k))
       | Falt r -> down r.f (R_falt_todo (r.tag, r.b, k))
       | Free r -> down r.inside k
     and up v k =
@@ -947,11 +1020,11 @@ module Make (W : Width.S) = struct
       | R_cat_done (l, k) -> up (l ^^ v) k
       | R_alt_todo (b, k) -> down b (R_alt_done (v, k))
       | R_alt_done (f, k) -> up (flat_alt f v) k
-      | R_group k -> up (group v) k
+      | R_group (yields, k) -> up (group ~yields v) k
       | R_nest (j, k) -> up (nest j v) k
       | R_align (to_line, k) -> up (aligned ~to_line v) k
       | R_annot (a, k) -> up (annotate a v) k
-      | R_frame (tag, k) -> up (frame tag v) k
+      | R_frame (tag, yields, k) -> up (frame ~yields tag v) k
       | R_falt_todo (tag, b, k) -> down b (R_falt_done (tag, v, k))
       | R_falt_done (tag, f, k) -> up (frame_alt tag f v) k
     in
@@ -967,11 +1040,12 @@ module Make (W : Width.S) = struct
       | Hard -> up Hard k
       | Cat r -> down r.l (R_cat_todo (r.r, k))
       | Alt r -> down r.f (R_alt_todo (r.b, k))
-      | Group r -> down r.d (R_group k)
+      | Group r -> down r.d (R_group (false, k))
+      | Yielding r -> down r.d (R_group (true, k))
       | Nest r -> down r.d (R_nest (r.j, k))
       | Align r -> down r.d (R_align (r.to_line, k))
       | Annot r -> down r.d k
-      | Frame r -> down r.d (R_frame (r.tag, k))
+      | Frame r -> down r.d (R_frame (r.tag, yields_bit r.flags, k))
       | Falt r -> down r.f (R_falt_todo (r.tag, r.b, k))
       | Free r -> down r.inside k
     and up v k =
@@ -981,11 +1055,11 @@ module Make (W : Width.S) = struct
       | R_cat_done (l, k) -> up (l ^^ v) k
       | R_alt_todo (b, k) -> down b (R_alt_done (v, k))
       | R_alt_done (f, k) -> up (flat_alt f v) k
-      | R_group k -> up (group v) k
+      | R_group (yields, k) -> up (group ~yields v) k
       | R_nest (j, k) -> up (nest j v) k
       | R_align (to_line, k) -> up (aligned ~to_line v) k
       | R_annot ((), k) -> up v k
-      | R_frame (tag, k) -> up (frame tag v) k
+      | R_frame (tag, yields, k) -> up (frame ~yields tag v) k
       | R_falt_todo (tag, b, k) -> down b (R_falt_done (tag, v, k))
       | R_falt_done (tag, f, k) -> up (frame_alt tag f v) k
     in
@@ -1034,6 +1108,7 @@ module Make (W : Width.S) = struct
          | Cat r -> go (Check r.l :: Check r.r :: rest)
          | Alt r -> go (Check r.f :: Check r.b :: rest)
          | Group r -> go (Check r.d :: rest)
+         | Yielding r -> go (Check r.d :: rest)
          | Nest r -> go (Check r.d :: rest)
          | Align r -> go (Check r.d :: rest)
          | Annot r -> go (Check r.d :: rest)
@@ -1143,6 +1218,9 @@ module Make (W : Width.S) = struct
          | Group r ->
            enter "(group";
            go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
+         | Yielding r ->
+           enter "(group-yields";
+           go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
          | Nest r ->
            enter "(nest";
            Format.pp_print_space ppf ();
@@ -1155,7 +1233,7 @@ module Make (W : Width.S) = struct
            enter "(annotate";
            go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
          | Frame r ->
-           enter "(frame";
+           enter (if yields_bit r.flags then "(frame-yields" else "(frame");
            print_tag r.tag;
            go (Pp_space :: Pp_doc r.d :: Pp_text ")" :: Pp_close :: k)
          | Falt r ->
@@ -1575,6 +1653,18 @@ module Make (W : Width.S) = struct
           st.flat <- true;
           st.k <- KGroup (s, r.d, st.k);
           step st r.d))
+    | Yielding y ->
+      (* The decision a [Group] makes, by the same test. What sets a yielding
+         group apart is what the groups before it counted, and they read that
+         from its [lead] before the engine came to it. Its [flags] go unread
+         here for the reason given above. *)
+      if st.flat || W.compare (reach st y.req) st.ruler > 0
+      then step st y.d
+      else (
+        let s = snapshot st in
+        st.flat <- true;
+        st.k <- KGroup (s, y.d, st.k);
+        step st y.d)
     | Frame r ->
       if st.flat
       then (

@@ -118,7 +118,9 @@ val unicode_version : string
       strict printer does. That is measured as it will print: a conditional at
       its broken branch, since a group only decides while the groups around it
       are broken, and a group further along at its flat width, which it then
-      takes.
+      takes. A group made with [~yields:true] is counted as far as its own
+      first break, the width it leaves on the line if it breaks, and decides
+      for itself when it is reached; see {!module-type-S.group}.
 
     {[
       group (text "ab" ^^ line ^^ text "cd") ^^ text "efgh"
@@ -218,8 +220,80 @@ module type S = sig
 
   (** [group d] lays [d] out flat if it fits in the ruler from the current
       column, and broken otherwise. The decision is made by measuring [d] before
-      rendering it. *)
-  val group : 'a t -> 'a t
+      rendering it.
+
+      [yields] says how the groups before this one on its line count it under
+      {!Line}. It defaults to [false], and {!Content} leaves it unread.
+
+      A group counts one further along its line at its flat width. Where a
+      line is too long for two groups, the first is the one that breaks, and
+      the second fits on the line that is left:
+
+      {[
+        let params =
+          group
+            (text "("
+             ^^ nest 2 (softline ^^ text "sig," ^^ line ^^ text "ps")
+             ^^ softline
+             ^^ text ")")
+        and body =
+          group
+            (text "{"
+             ^^ nest 2 (line ^^ text "aaaa" ^^ line ^^ text "bbbb")
+             ^^ line
+             ^^ text "}")
+        in
+        text "def f" ^^ params ^^ text ": Bool " ^^ body
+        (* at width 26, under Line:
+
+           def f(
+             sig,
+             ps
+           ): Bool { aaaa bbbb }       *)
+      ]}
+
+      A group made with [~yields:true] is counted as far as its first break,
+      which is the width it leaves on the line if it breaks. With [body] made
+      that way, [params] counts [": Bool {"] after itself, and fits:
+
+      {[
+        (* def f(sig, ps): Bool {
+             aaaa
+             bbbb
+           }                           *)
+      ]}
+
+      The yielding group decides as every group does: by its own flat width and
+      what follows it, from the column it starts at. A line it lies flat on was
+      measured to its end by that test, and a line it breaks on was measured to
+      its end by the group before it. So every line holding a declined break
+      stays within the ruler, as {!resolutions} describes.
+
+      What the earlier groups count is the yielding group laid out broken, as
+      far as the first break in it:
+
+      - A group inside it that comes before that break counts at its flat
+        width, as a group does anywhere. [group ~yields:true (group d)] counts
+        flat for that reason, and so does a yielding group inside a later group
+        made without [yields].
+      - Where the group is wider up to its first break than it is flat, it
+        counts at its flat width. That takes a {!flat_alt} whose broken branch
+        is the wider. A yielding group therefore never counts for more than the
+        same group made without [yields], and making a group yield never takes
+        an earlier group off its line.
+
+      [yields] suits a group that puts text before its first break, as a block
+      puts its opening bracket. One that starts with a break gives the groups
+      before it nothing to count: they lie flat, and it breaks at once.
+
+      With several yielding groups on a line, the last is the first to break:
+
+      {[
+        (* if (c) { aaaa } else {
+             bbbb
+           }                           *)
+      ]} *)
+  val group : ?yields:bool -> 'a t -> 'a t
 
   (** [nest j d] renders [d] with the indentation level increased by [j], which
       is the number of spaces emitted after every line break inside [d]. [j] may
@@ -308,8 +382,13 @@ module type S = sig
       Building a document of [n] nodes, counted as a tree, costs
       [O(n log^2 n)] at most, and a frame [O(log k)] for [k] frames whose
       conditionals pass through it. Rendering and {!check} look each frame and
-      conditional up in the set of frames around it, at [O(log k)] each. *)
-  val framed : (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
+      conditional up in the set of frames around it, at [O(log k)] each.
+
+      [yields] is as for {!group}: under {!Line}, the groups before this frame
+      on its line count it as far as its first break. Its own conditionals are
+      at their broken branch in that count, which is the branch they take
+      where the frame breaks. *)
+  val framed : ?yields:bool -> (('a t -> 'a t -> 'a t) -> 'a t) -> 'a t
 
   (** {2 Annotations}
 
@@ -348,7 +427,10 @@ module type S = sig
       [framed] prints as [(frame n d)] and each of its conditionals as
       [(frame-alt n a b)], where [n] numbers the frames from 0 in the order the
       printout first meets them. The same document prints the same way however
-      many frames the process made before it. *)
+      many frames the process made before it.
+
+      A group made with [~yields:true] prints as [(group-yields d)], and a
+      frame as [(frame-yields n d)]. *)
   val pp : Format.formatter -> 'a t -> unit
 
   val pp_error : Format.formatter -> error -> unit
@@ -384,7 +466,9 @@ module type S = sig
       ]}
 
       Under {!Line} that check holds for every document without a newline in a
-      text node, because each group measures its line up to the next break.
+      text node, because each group measures its line up to the next break. A
+      group made with [~yields:true] ends that measure where it would break,
+      and measures the rest of the line itself before it lies flat.
 
       Under {!Content} it holds where the caller accounts for everything it
       places on a line. The engine's guarantee covers the flat region it

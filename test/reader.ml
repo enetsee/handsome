@@ -152,6 +152,10 @@ let read (s : string) : unit H.t =
          let d = doc () in
          expect_rpar ();
          H.group d
+       | Atom "group-yields" ->
+         let d = doc () in
+         expect_rpar ();
+         H.group ~yields:true d
        | Atom "nest" ->
          let j =
            match pop () with
@@ -173,10 +177,10 @@ let read (s : string) : unit H.t =
          let d = doc () in
          expect_rpar ();
          H.annotate () d
-       | Atom "frame" ->
+       | Atom (("frame" | "frame-yields") as head) ->
          let n = pop_number toks in
          let d =
-           H.framed (fun alt ->
+           H.framed ~yields:(String.equal head "frame-yields") (fun alt ->
              Hashtbl.replace alts n alt;
              doc ())
          in

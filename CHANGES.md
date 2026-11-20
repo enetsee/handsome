@@ -34,6 +34,15 @@ Also:
   `def f() = {`, indents from that line whether the header fitted on one or
   broke over several. PPrint has nothing like it, so the PPrint differential
   leaves it out and the reference renderer in the test suite checks it.
+- `group ~yields:true` and `framed ~yields:true`. Under `Line` a group counts a
+  group further along its line at its flat width, so where a line is too long
+  for a parameter list and the block after it, the list opens. A yielding group
+  is counted as far as its first break, the width it leaves on the line if it
+  breaks: the list stays whole while `def f(sig, ps): Bool {` fits, and the
+  block takes the break. The yielding group decides as every group does, so a
+  line holding a declined break still stays within the ruler. It never counts
+  for more than the same group made without the flag. `Content` leaves the flag
+  unread, and a document built without it is built as before.
 - `add` must be commutative as well as associative, since a frame adds up its
   conditionals' widths out of document order.
 - Width is a functor parameter with a documented obligation — `measure` must

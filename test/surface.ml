@@ -8,7 +8,10 @@
    [Framed] is [framed], and [Frame_alt] one of the conditionals it hands out,
    written as a reference to an enclosing [Framed]: [Frame_alt (0, _, _)] reads
    the innermost [Framed] around it, [1] the next out, and an index past the last
-   is a conditional outside its frame. *)
+   is a conditional outside its frame.
+
+   [Yielding] is [group ~yields:true] and [Yielding_framed] is
+   [framed ~yields:true]. *)
 
 open StdLabels
 
@@ -23,11 +26,13 @@ type t =
   | Hardline
   | Blank
   | Group of t
+  | Yielding of t
   | Nest of int * t
   | Align of t
   | From_line of t
   | Annot of int * t
   | Framed of t
+  | Yielding_framed of t
   | Frame_alt of int * t * t
 
 (* -- interpretation into handsome ------------------------------------------ *)
@@ -66,11 +71,13 @@ module Doc (H : DOC) = struct
       | Hardline -> H.hardline
       | Blank -> H.blank
       | Group d -> H.group (go alts d)
+      | Yielding d -> H.group ~yields:true (go alts d)
       | Nest (j, d) -> H.nest j (go alts d)
       | Align d -> H.align (go alts d)
       | From_line d -> H.from_line (go alts d)
       | Annot (a, d) -> H.annotate a (go alts d)
       | Framed d -> H.framed (fun alt -> go (alt :: alts) d)
+      | Yielding_framed d -> H.framed ~yields:true (fun alt -> go (alt :: alts) d)
       | Frame_alt (i, a, b) ->
         let alt =
           match List.nth_opt alts i with
@@ -106,6 +113,10 @@ let to_doc = Ascii_doc.to_doc
    is a group, and maps to one. PPrint indents from a column or from the
    enclosing nest, never from the line a document starts on, so [From_line] has
    no counterpart either.
+
+   PPrint decides by content, and under that rule [~yields:true] is unread, so
+   [Yielding] maps to a group and [Yielding_framed] as [Framed] does. The
+   differential then holds the engine to leaving the flag unread.
    -------------------------------------------------------------------------- *)
 
 let no_counterpart (what : string) =
@@ -125,12 +136,12 @@ let rec to_pprint : t -> PPrint.document = function
   | Softline -> PPrint.ifflat PPrint.empty PPrint.hardline
   | Hardline -> PPrint.hardline
   | Blank -> PPrint.ifflat (PPrint.string " ") PPrint.empty
-  | Group d -> PPrint.group (to_pprint d)
+  | Group d | Yielding d -> PPrint.group (to_pprint d)
   | Nest (j, d) -> PPrint.nest j (to_pprint d)
   | Align d -> PPrint.align (to_pprint d)
   | From_line _ -> no_counterpart "from_line"
   | Annot (_, d) -> to_pprint d
-  | Framed d -> PPrint.group (to_pprint d)
+  | Framed d | Yielding_framed d -> PPrint.group (to_pprint d)
   | Frame_alt _ -> no_counterpart "a frame's conditional"
 ;;
 
@@ -148,12 +159,12 @@ let rec to_pprint_idiomatic : t -> PPrint.document = function
      space when flat alone. PPrint has this branch alone as its counterpart, so
      it is kept exact and the comparison isolates [break]. *)
   | Blank -> PPrint.ifflat (PPrint.string " ") PPrint.empty
-  | Group d -> PPrint.group (to_pprint_idiomatic d)
+  | Group d | Yielding d -> PPrint.group (to_pprint_idiomatic d)
   | Nest (j, d) -> PPrint.nest j (to_pprint_idiomatic d)
   | Align d -> PPrint.align (to_pprint_idiomatic d)
   | From_line _ -> no_counterpart "from_line"
   | Annot (_, d) -> to_pprint_idiomatic d
-  | Framed d -> PPrint.group (to_pprint_idiomatic d)
+  | Framed d | Yielding_framed d -> PPrint.group (to_pprint_idiomatic d)
   | Frame_alt _ -> no_counterpart "a frame's conditional"
 ;;
 
@@ -176,7 +187,13 @@ let rec is_empty = function
   | Empty -> true
   | Cat (a, b) -> is_empty a && is_empty b
   | Concat ds -> List.for_all ~f:is_empty ds
-  | Group d | Nest (_, d) | Align d | From_line d | Framed d -> is_empty d
+  | Group d
+  | Yielding d
+  | Nest (_, d)
+  | Align d
+  | From_line d
+  | Framed d
+  | Yielding_framed d -> is_empty d
   | Annot _ | Flat_alt _ | Line | Softline | Hardline | Blank | Frame_alt _ -> false
 ;;
 
@@ -201,8 +218,9 @@ let offenders d =
       go scope a;
       go scope b
     | Concat ds -> List.iter ~f:(go scope) ds
-    | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) -> go scope d
-    | Framed d -> if not (is_empty d) then go (fresh () :: scope) d
+    | Group d | Yielding d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
+      go scope d
+    | Framed d | Yielding_framed d -> if not (is_empty d) then go (fresh () :: scope) d
     | Frame_alt (i, a, b) ->
       if i >= List.length scope then acc := Outside (fresh ()) :: !acc;
       go scope a;
@@ -217,10 +235,11 @@ let offenders d =
 (* Whether [d] holds a conditional whose [Framed] is outside it. *)
 let rec has_free depth = function
   | Frame_alt (i, a, b) -> i >= depth || has_free depth a || has_free depth b
-  | Framed d -> has_free (depth + 1) d
+  | Framed d | Yielding_framed d -> has_free (depth + 1) d
   | Cat (a, b) | Flat_alt (a, b) -> has_free depth a || has_free depth b
   | Concat ds -> List.exists ~f:(has_free depth) ds
-  | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) -> has_free depth d
+  | Group d | Yielding d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
+    has_free depth d
   | Text _ | Empty | Line | Softline | Hardline | Blank -> false
 ;;
 
@@ -228,11 +247,34 @@ let rec has_free depth = function
    which the interface measures at its wider branch. *)
 let rec nested_free = function
   | Frame_alt (_, a, b) -> has_free 0 a || has_free 0 b || nested_free a || nested_free b
-  | Framed d | Group d | Nest (_, d) | Align d | From_line d | Annot (_, d) ->
-    nested_free d
+  | Framed d
+  | Yielding_framed d
+  | Group d
+  | Yielding d
+  | Nest (_, d)
+  | Align d
+  | From_line d
+  | Annot (_, d) -> nested_free d
   | Cat (a, b) | Flat_alt (a, b) -> nested_free a || nested_free b
   | Concat ds -> List.exists ~f:nested_free ds
   | Text _ | Empty | Line | Softline | Hardline | Blank -> false
+;;
+
+(* -- without [~yields:true] ------------------------------------------------ *)
+
+(* [d] with every group and frame made without [yields]. *)
+let rec unyielding = function
+  | Yielding d | Group d -> Group (unyielding d)
+  | Yielding_framed d | Framed d -> Framed (unyielding d)
+  | Cat (a, b) -> Cat (unyielding a, unyielding b)
+  | Concat ds -> Concat (List.map ~f:unyielding ds)
+  | Flat_alt (a, b) -> Flat_alt (unyielding a, unyielding b)
+  | Nest (j, d) -> Nest (j, unyielding d)
+  | Align d -> Align (unyielding d)
+  | From_line d -> From_line (unyielding d)
+  | Annot (a, d) -> Annot (a, unyielding d)
+  | Frame_alt (i, a, b) -> Frame_alt (i, unyielding a, unyielding b)
+  | (Text _ | Empty | Line | Softline | Hardline | Blank) as d -> d
 ;;
 
 (* -- printing, for failure output ------------------------------------------ *)
@@ -248,11 +290,13 @@ let rec show = function
   | Hardline -> "hardline"
   | Blank -> "blank"
   | Group d -> Printf.sprintf "(group %s)" (show d)
+  | Yielding d -> Printf.sprintf "(group ~yields:true %s)" (show d)
   | Nest (j, d) -> Printf.sprintf "(nest %d %s)" j (show d)
   | Align d -> Printf.sprintf "(align %s)" (show d)
   | From_line d -> Printf.sprintf "(from_line %s)" (show d)
   | Annot (a, d) -> Printf.sprintf "(annotate %d %s)" a (show d)
   | Framed d -> Printf.sprintf "(framed %s)" (show d)
+  | Yielding_framed d -> Printf.sprintf "(framed ~yields:true %s)" (show d)
   | Frame_alt (i, a, b) -> Printf.sprintf "(frame_alt %d %s %s)" i (show a) (show b)
 ;;
 
@@ -287,6 +331,13 @@ type flavour =
           compared with no independently written printer. That loss is
           permanent. {!Reference} is the second implementation it is checked
           against, and was written from the same specification. *)
+  ; yields : bool
+    (** [group ~yields:true], and [framed ~yields:true] where there are
+          frames. Only {!Handsome.Line} reads the flag. Under
+          {!Handsome.Content} a document renders the same with it and without,
+          so the differential corpora carry it and PPrint is the check that it
+          is unread there. {!Reference} is the second implementation under
+          [Line]. *)
   }
 
 let plain =
@@ -299,10 +350,18 @@ let plain =
   ; aligns = true
   ; from_lines = false
   ; frames = false
+  ; yields = false
   }
 ;;
 
-let rich = { plain with annotations = true; general_flat_alt = true; unicode = true }
+let rich =
+  { plain with
+    annotations = true
+  ; general_flat_alt = true
+  ; unicode = true
+  ; yields = true
+  }
+;;
 
 (* Well-formed UTF-8, exercising dedent and frames, which PPrint cannot
    express. *)
@@ -393,12 +452,34 @@ let gen flavour =
                   (Gen.int_range 0 3)
                   (Gen.sized_size (Gen.pure (n / 3)) node)) )
          ; 5, Gen.map (fun d -> Group d) (Gen.sized_size (Gen.pure (n - 1)) node)
-         ; ( 3
-           , Gen.map2
-               (fun j d -> Nest (j, d))
-               (if flavour.neg_nest then Gen.int_range (-3) 6 else Gen.int_range 0 6)
-               (Gen.sized_size (Gen.pure (n - 1)) node) )
          ]
+         @ (if flavour.yields
+            then
+              [ 2, Gen.map (fun d -> Yielding d) (Gen.sized_size (Gen.pure (n - 1)) node)
+                (* The shape it is for: a group, then on the same line a block
+                   that puts its opening bracket before its first break. *)
+              ; ( 2
+                , Gen.map3
+                    (fun h w b ->
+                       Cat
+                         ( Group h
+                         , Cat
+                             ( Text w
+                             , Yielding
+                                 (Concat
+                                    [ Text "{"; Nest (2, Cat (Line, b)); Line; Text "}" ])
+                             ) ))
+                    half
+                    (gen_text flavour)
+                    half )
+              ]
+            else [])
+         @ [ ( 3
+             , Gen.map2
+                 (fun j d -> Nest (j, d))
+                 (if flavour.neg_nest then Gen.int_range (-3) 6 else Gen.int_range 0 6)
+                 (Gen.sized_size (Gen.pure (n - 1)) node) )
+           ]
          @ (if flavour.aligns
             then
               [ 2, Gen.map (fun d -> Align d) (Gen.sized_size (Gen.pure (n - 1)) node) ]
@@ -440,6 +521,32 @@ let gen flavour =
               ; ( 2
                 , Gen.map3
                     (fun d e alt -> Framed (Cat (d, Group (Cat (e, alt)))))
+                    half
+                    half
+                    (gen_frame_alt_leaf flavour) )
+              ]
+            else [])
+         @ (if flavour.frames && flavour.yields
+            then
+              [ ( 1
+                , Gen.map
+                    (fun d -> Yielding_framed d)
+                    (Gen.sized_size (Gen.pure (n - 1)) node) )
+                (* A block with a trailing separator after a group: the block is
+                   a yielding frame, and its last element prints the separator
+                   where the block breaks. *)
+              ; ( 1
+                , Gen.map3
+                    (fun h b alt ->
+                       Cat
+                         ( Group h
+                         , Yielding_framed
+                             (Concat
+                                [ Text "{"
+                                ; Nest (2, Concat [ Line; b; alt ])
+                                ; Line
+                                ; Text "}"
+                                ]) ))
                     half
                     half
                     (gen_frame_alt_leaf flavour) )

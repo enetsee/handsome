@@ -119,6 +119,48 @@ let unit_cases =
   ]
 ;;
 
+let pp_prints_yields =
+  (* The printed form is what a caller reads to see why a line was laid out as
+     it was, so it says which groups yield. The round-trip above runs over a
+     corpus without frames, which leaves a yielding frame to this case. *)
+  ( "pp prints a yielding group and a yielding frame as such"
+  , `Quick
+  , fun () ->
+      let block s = H.text "{" ^^ H.line ^^ H.text s ^^ H.line ^^ H.text "}" in
+      let d =
+        H.group ~yields:true (block "a")
+        ^^ H.framed ~yields:true (fun alt -> block "b" ^^ alt H.empty (H.text ";"))
+        ^^ H.group (block "c")
+        ^^ H.framed (fun _ -> block "d")
+      in
+      let heads printed =
+        Reader.tokenise printed
+        |> List.filter_map ~f:(function
+          | Reader.Atom
+              (("group" | "group-yields" | "frame" | "frame-yields" | "frame-alt") as a)
+            -> Some a
+          | Reader.Atom _ | Reader.Lpar | Reader.Rpar | Reader.Str _ -> None)
+      in
+      let printed = Reader.print_doc d in
+      Alcotest.(check (list string))
+        "heads"
+        [ "group-yields"; "frame-yields"; "frame-alt"; "group"; "frame" ]
+        (heads printed);
+      let back = Reader.read printed in
+      Alcotest.(check string) "read back" printed (Reader.print_doc back);
+      (* Read back, each group is counted as it was. At 8 the first block
+         counts the second as far as its bracket and stays flat. *)
+      let str d = H.to_string (fst (H.render ~fit:Line ~width:8 d)) in
+      Alcotest.(check string) "layout" (str d) (str back) )
+;;
+
+(* MUTATION pp prints yields:
+     in [pp], the [Frame] case, replace
+         enter (if yields_bit r.flags then "(frame-yields" else "(frame");
+     with
+         enter "(frame";
+   -- a yielding frame prints as a plain one, and reads back as one. *)
+
 let suite =
   ( "doc"
   , unit_cases
@@ -126,5 +168,6 @@ let suite =
       ; check_agrees_with_ground_truth
       ; pp_round_trips
       ; pp_round_trip_is_exact_on_unit
+      ; pp_prints_yields
       ] )
 ;;
